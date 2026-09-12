@@ -1236,6 +1236,22 @@ pm2 save
 pm2 startup
 ```
 
+### Linux Desktop (systemd --user)
+
+Run the gateway as a background user service and add it to the desktop app menu
+(Omarchy and other systemd distributions):
+
+```bash
+npm run build
+cp .env.example .env   # then edit
+scripts/install-linux-desktop.sh
+```
+
+The script writes `~/.config/systemd/user/9router.service`, the `~/.local/bin/9router-web`
+launcher, a `9router.desktop` menu entry and the icon, then enables and starts the
+service. Re-run it after a rebuild; remove everything with
+`scripts/install-linux-desktop.sh --uninstall`.
+
 ### Docker
 
 Published images (multi-platform `linux/amd64` + `linux/arm64`):
