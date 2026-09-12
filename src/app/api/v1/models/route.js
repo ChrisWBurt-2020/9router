@@ -134,6 +134,52 @@ const LIVE_MODEL_RESOLVERS = {
   },
 };
 
+// OpenRouter exposes a dedicated image catalog whose records include the
+// definitive per-model parameter set. Keep it separate from the text /models
+// resolver so image discovery never replaces the normal chat catalog.
+const LIVE_IMAGE_MODEL_RESOLVERS = {
+  openrouter: async (conn) => {
+    if (!conn?.apiKey) return null;
+    const response = await fetch("https://openrouter.ai/api/v1/images/models", {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${conn.apiKey}`,
+        "HTTP-Referer": "https://endpoint-proxy.local",
+        "X-Title": "Endpoint Proxy",
+      },
+      cache: "no-store",
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    const raw = Array.isArray(payload) ? payload : payload?.data;
+    if (!Array.isArray(raw)) return null;
+    const models = raw
+      // The endpoint is already image-scoped. Some compatible deployments omit
+      // the architecture block, so do not discard otherwise valid catalog rows.
+      .filter((item) => item?.id)
+      .map((item) => {
+        const params = item.supported_parameters && typeof item.supported_parameters === "object" && !Array.isArray(item.supported_parameters)
+          ? Object.keys(item.supported_parameters)
+          : [];
+        return {
+          id: item.id,
+          name: item.name || item.id,
+          kind: "image",
+          params,
+          inputModalities: item.architecture?.input_modalities || ["text"],
+          outputModalities: item.architecture?.output_modalities || ["image"],
+          supportedParameters: item.supported_parameters || {},
+          capabilities: {
+            text2img: true,
+            edit: item.architecture?.input_modalities?.includes("image") === true,
+            vector: item.supported_parameters?.output_format?.values?.includes("svg") === true,
+          },
+        };
+      });
+    return models.length ? { models } : null;
+  },
+};
+
 const parseOpenAIStyleModels = (data) => {
   if (Array.isArray(data)) return data;
   return data?.data || data?.models || data?.results || [];
@@ -327,11 +373,22 @@ export async function buildModelsList(kindFilter, options = {}) {
       for (const model of providerModels) {
         if (!kindFilter.includes(modelKind(model))) continue;
         if (isDisabled(alias, model.id)) continue;
-        models.push({
+        const modelEntry = {
           id: `${alias}/${model.id}`,
           object: "model",
           owned_by: alias,
-        });
+        };
+        // Preserve the compact legacy shape for chat listings while exposing
+        // curated image parameter/capability metadata when no live catalog is
+        // available.
+        if (kindFilter.includes("image") && modelKind(model) === "image") {
+          if (model.name) modelEntry.name = model.name;
+          modelEntry.kind = "image";
+          if (Array.isArray(model.params) && model.params.length) modelEntry.params = model.params;
+          if (Array.isArray(model.capabilities) && model.capabilities.length) modelEntry.capabilities = model.capabilities;
+          if (model.supportedParameters) modelEntry.supported_parameters = model.supportedParameters;
+        }
+        models.push(modelEntry);
       }
     }
 
@@ -372,8 +429,10 @@ export async function buildModelsList(kindFilter, options = {}) {
       const staticModelKindById = new Map(
         providerModels.map((m) => [m.id, modelKind(m)])
       );
+      const staticModelById = new Map(providerModels.map((m) => [m.id, m]));
       let liveModelKindById = new Map();
       let liveCapabilitiesById = new Map();
+      let liveModelMetaById = new Map();
 
       let rawModelIds = hasExplicitEnabledModels
         ? Array.from(
@@ -411,6 +470,32 @@ export async function buildModelsList(kindFilter, options = {}) {
           }
         } catch (err) {
           console.log(`Live model fetch failed for ${providerId}: ${err?.message || err}`);
+        }
+      }
+
+      // Image catalogs use a separate OpenRouter endpoint and are only queried
+      // for the image model listing. An explicitly enabled model list remains
+      // authoritative and skips live discovery.
+      const liveImageResolver = LIVE_IMAGE_MODEL_RESOLVERS[providerId];
+      if (kindFilter.includes("image") && liveImageResolver && !hasExplicitEnabledModels) {
+        try {
+          const live = await liveImageResolver(conn);
+          if (live?.models?.length) {
+            rawModelIds = live.models.map((m) => m.id);
+            liveModelKindById = new Map(live.models.map((m) => [m.id, "image"]));
+            liveCapabilitiesById = new Map(
+              live.models
+                .filter((m) => m?.id && m.capabilities)
+                .map((m) => [m.id, m.capabilities]),
+            );
+            liveModelMetaById = new Map(
+              live.models
+                .filter((m) => m?.id)
+                .map((m) => [m.id, m]),
+            );
+          }
+        } catch (err) {
+          console.log(`Live image model fetch failed for ${providerId}: ${err?.message || err}`);
         }
       }
 
@@ -487,6 +572,23 @@ export async function buildModelsList(kindFilter, options = {}) {
           object: "model",
           owned_by: outputAlias,
         };
+        const staticMeta = staticModelById.get(modelId);
+        if (kind === "image" && staticMeta) {
+          if (staticMeta.name) model.name = staticMeta.name;
+          model.kind = "image";
+          if (Array.isArray(staticMeta.params) && staticMeta.params.length) model.params = staticMeta.params;
+          if (Array.isArray(staticMeta.capabilities) && staticMeta.capabilities.length) model.capabilities = staticMeta.capabilities;
+          if (staticMeta.supportedParameters) model.supported_parameters = staticMeta.supportedParameters;
+        }
+        const liveMeta = liveModelMetaById.get(modelId);
+        if (liveMeta?.name) model.name = liveMeta.name;
+        if (liveMeta?.kind) model.kind = liveMeta.kind;
+        if (Array.isArray(liveMeta?.params) && liveMeta.params.length) model.params = liveMeta.params;
+        if (liveMeta?.inputModalities) model.input_modalities = liveMeta.inputModalities;
+        if (liveMeta?.outputModalities) model.output_modalities = liveMeta.outputModalities;
+        if (liveMeta?.supportedParameters && Object.keys(liveMeta.supportedParameters).length) {
+          model.supported_parameters = liveMeta.supportedParameters;
+        }
         // Live-catalog resolvers (kiro/qoder/github/clinepass) mostly only return
         // { id, name } — no per-model capability data. Fall back to the same
         // pattern-matched capabilities the dashboard uses (useModelCaps.js) so

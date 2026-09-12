@@ -1,6 +1,6 @@
 ---
 name: 9router-image
-description: Generate images via 9Router /v1/images/generations using OpenAI / Gemini Imagen / DALL-E / FLUX / MiniMax / SDWebUI / ComfyUI / Codex models. Use when the user wants to create, generate, draw, or render an image, picture, or text-to-image (txt2img).
+description: Generate images via 9Router /v1/images/generations using OpenAI / OpenRouter / Gemini Imagen / DALL-E / FLUX / MiniMax / SDWebUI / ComfyUI / Codex models. Use when the user wants to create, generate, draw, or render an image, picture, or text-to-image (txt2img).
 ---
 
 # 9Router — Image Generation
@@ -54,12 +54,50 @@ const { data } = await r.json();
 console.log(data[0].url || data[0].b64_json.slice(0, 40));
 ```
 
+## OpenRouter image models
+
+The public 9Router route remains `/v1/images/generations`; only the OpenRouter
+upstream uses its dedicated `POST https://openrouter.ai/api/v1/images` route.
+Discover the image catalog with:
+
+```bash
+curl "$NINEROUTER_URL/v1/models/image" | jq '.data[].id'
+```
+
+Recommended models for illustrated, reference-consistent books:
+
+- `openrouter/bytedance-seed/seedream-5-0-lite` — default 2K workhorse; supports up to 14 references and a seed.
+- `openrouter/google/gemini-3.1-flash-lite-image` — 1K quality/consistency alternative with up to 14 references.
+- `openrouter/black-forest-labs/flux.2-klein-4b` or `openrouter/sourceful/riverflow-v2.5-fast` — low-cost draft tiers.
+- `openrouter/recraft/recraft-v4.1-vector` — SVG icon/silhouette output.
+
+OpenRouter accepts native image controls such as `resolution`, `aspect_ratio`,
+`output_format`, `seed`, and `input_references`. References use OpenRouter's
+image URL shape and may be HTTPS URLs or `data:image/...;base64,...` values:
+
+```json
+{
+  "model": "openrouter/bytedance-seed/seedream-5-0-lite",
+  "prompt": "A heron crossing a misty marsh at dawn",
+  "resolution": "2K",
+  "aspect_ratio": "4:3",
+  "seed": 42,
+  "input_references": [
+    { "type": "image_url", "image_url": { "url": "data:image/png;base64,..." } }
+  ],
+  "provider": { "sort": "price", "allow_fallbacks": true }
+}
+```
+
 ## Response shape
 
 JSON (default `response_format=url`):
 ```json
 { "created": 1735000000, "data": [{ "url": "https://..." }] }
 ```
+
+OpenRouter's dedicated Images API returns `b64_json` (and may include
+`media_type`) even though the public route remains OpenAI-compatible.
 
 `response_format=b64_json`:
 ```json
@@ -74,7 +112,8 @@ Common fields above work everywhere. These add/override:
 
 | Provider | Extra/changed fields | Notes |
 |---|---|---|
-| `openai`, `minimax`, `openrouter`, `recraft` | `quality`, `style`, `response_format` | Standard OpenAI shape |
+| `openai`, `minimax`, `recraft` | `quality`, `style`, `response_format` | Standard OpenAI shape |
+| `openrouter` | `resolution`, `aspect_ratio`, `size`, `quality`, `output_format`, `background`, `output_compression`, `seed`, `input_references`, `provider` | Dedicated `/api/v1/images` route; response data is base64 with optional `media_type` |
 | `gemini` (nano-banana) | — | Only `prompt`; ignores `size`/`n` |
 | `codex` (gpt-5.4-image) | `image`, `images[]`, `image_detail`, `output_format`, `background` | SSE stream; **ChatGPT Plus/Pro required** |
 | `huggingface` | — | Only `prompt`; returns single image |

@@ -233,12 +233,12 @@ describe("handleImageGenerationCore", () => {
     expect(responseBody.data).toHaveLength(2);
   });
 
-  it("handles OpenRouter with HTTP-Referer header", async () => {
+  it("handles OpenRouter Images API with HTTP-Referer header", async () => {
     global.fetch.mockResolvedValueOnce(
       new Response(
         JSON.stringify({
           created: 1234567890,
-          data: [{ url: "https://example.com/or.png" }],
+          data: [{ b64_json: "cG5n" }],
         }),
         { status: 200, headers: { "Content-Type": "application/json" } }
       )
@@ -253,7 +253,7 @@ describe("handleImageGenerationCore", () => {
 
     expect(result.success).toBe(true);
     expect(global.fetch).toHaveBeenCalledWith(
-      "https://openrouter.ai/api/v1/images/generations",
+      "https://openrouter.ai/api/v1/images",
       expect.objectContaining({
         headers: expect.objectContaining({
           "HTTP-Referer": "https://endpoint-proxy.local",
@@ -261,6 +261,65 @@ describe("handleImageGenerationCore", () => {
         }),
       })
     );
+  });
+
+  it("forwards OpenRouter references, deterministic seed, native sizing, and price routing", async () => {
+    global.fetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ created: 1234567890, data: [{ b64_json: "cG5n", media_type: "image/png" }], usage: { images: 1 } }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const result = await handleImageGenerationCore({
+      body: {
+        prompt: "A heron at dawn",
+        model: "ignored-by-router",
+        size: "1024x768",
+        resolution: "2K",
+        seed: 42,
+        input_references: [{ type: "image_url", image_url: { url: "data:image/png;base64,cG5n" } }],
+      },
+      modelInfo: { provider: "openrouter", model: "bytedance-seed/seedream-5-0-lite" },
+      credentials: { apiKey: "test-key" },
+      log: null,
+    });
+
+    expect(result.success).toBe(true);
+    const responseBody = await result.response.json();
+    expect(responseBody.data[0].media_type).toBe("image/png");
+    expect(responseBody.usage).toEqual({ images: 1 });
+    const requestBody = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(requestBody).toMatchObject({
+      model: "bytedance-seed/seedream-5-0-lite",
+      prompt: "A heron at dawn",
+      resolution: "2K",
+      aspect_ratio: "4:3",
+      seed: 42,
+      input_references: [{ type: "image_url", image_url: { url: "data:image/png;base64,cG5n" } }],
+      provider: { sort: "price", allow_fallbacks: true },
+    });
+  });
+
+  it("uses OpenRouter media_type for SVG binary output", async () => {
+    global.fetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ created: 1234567890, data: [{ b64_json: "PHN2Zy8+", media_type: "image/svg+xml" }] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const result = await handleImageGenerationCore({
+      body: { prompt: "A simple icon", output_format: "svg" },
+      modelInfo: { provider: "openrouter", model: "recraft/recraft-v4.1-vector" },
+      credentials: { apiKey: "test-key" },
+      binaryOutput: true,
+      log: null,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.response.headers.get("Content-Type")).toBe("image/svg+xml");
+    expect(result.response.headers.get("Content-Disposition")).toContain("image.svg");
   });
 
   it("handles Vercel AI Gateway image generation as OpenAI-compatible", async () => {

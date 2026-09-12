@@ -36,6 +36,43 @@ export default {
     { id: "openai/gpt-4o-mini-tts", name: "GPT-4o Mini TTS", kind: "tts" },
     { id: "openai/tts-1-hd", name: "TTS-1 HD", kind: "tts" },
     { id: "openai/tts-1", name: "TTS-1", kind: "tts" },
+    // Curated OpenRouter image catalog. Keep the legacy entries below so saved
+    // aliases continue to resolve while the live image catalog catches up.
+    {
+      id: "bytedance-seed/seedream-5-0-lite",
+      name: "Seedream 5.0 Lite (2K)",
+      params: ["n", "resolution", "aspect_ratio", "size", "input_references", "seed", "provider"],
+      capabilities: ["text2img", "edit"],
+      kind: "image",
+    },
+    {
+      id: "google/gemini-3.1-flash-lite-image",
+      name: "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)",
+      params: ["n", "resolution", "aspect_ratio", "input_references", "provider"],
+      capabilities: ["text2img", "edit"],
+      kind: "image",
+    },
+    {
+      id: "black-forest-labs/flux.2-klein-4b",
+      name: "FLUX.2 Klein 4B",
+      params: ["n", "aspect_ratio", "output_format", "input_references", "seed", "provider"],
+      capabilities: ["text2img", "edit"],
+      kind: "image",
+    },
+    {
+      id: "sourceful/riverflow-v2.5-fast",
+      name: "Riverflow V2.5 Fast",
+      params: ["n", "aspect_ratio", "resolution", "output_format", "background", "input_references", "provider"],
+      capabilities: ["text2img", "edit"],
+      kind: "image",
+    },
+    {
+      id: "recraft/recraft-v4.1-vector",
+      name: "Recraft V4.1 Vector (SVG)",
+      params: ["aspect_ratio", "output_format", "n", "input_references", "provider"],
+      capabilities: ["text2img", "edit", "vector"],
+      kind: "image",
+    },
     { id: "openai/dall-e-3", name: "DALL-E 3 (via OpenRouter)", params: ["size","quality","style","response_format"], kind: "image" },
     { id: "openai/gpt-image-1", name: "GPT Image 1 (via OpenRouter)", params: ["n","size","quality","response_format"], kind: "image" },
     { id: "google/imagen-3.0-generate-002", name: "Imagen 3 (via OpenRouter)", params: ["n","size"], kind: "image" },
@@ -44,7 +81,7 @@ export default {
     { id: "openai/sora-2-pro", name: "Sora 2 Pro (via OpenRouter)", params: ["duration","aspect_ratio","resolution"], kind: "video" },
     { id: "bytedance/seedance-2.0", name: "Seedance 2.0 (via OpenRouter)", params: ["duration","aspect_ratio","resolution"], kind: "video" },
   ],
-  serviceKinds: ["llm","embedding","tts","imageToText","video"],
+  serviceKinds: ["llm","embedding","tts","image","imageToText","video"],
   ttsConfig: {
     baseUrl: "https://openrouter.ai/api/v1/chat/completions",
     defaultModel: "openai/gpt-4o-mini-tts",
@@ -57,7 +94,7 @@ export default {
     headers: {"HTTP-Referer":"https://endpoint-proxy.local","X-Title":"Endpoint Proxy"},
   },
   imageConfig: {
-    baseUrl: "https://openrouter.ai/api/v1/images/generations",
+    baseUrl: "https://openrouter.ai/api/v1/images",
     headers: {"HTTP-Referer":"https://endpoint-proxy.local","X-Title":"Endpoint Proxy"},
   },
   // Async video jobs (POST /videos → { id, status }, GET /videos/{id} polls).

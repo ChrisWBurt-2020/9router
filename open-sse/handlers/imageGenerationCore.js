@@ -11,6 +11,36 @@ function serializeRequestBody(requestBody) {
   return JSON.stringify(requestBody);
 }
 
+function imageOutputMetadata(first, body) {
+  const mediaType = String(first?.media_type || first?.mime_type || "").toLowerCase().split(";", 1)[0];
+  const requestedFormat = String(body?.output_format || "").toLowerCase();
+  const format = mediaType === "image/svg+xml"
+    ? "svg"
+    : mediaType === "image/jpeg" || mediaType === "image/jpg"
+      ? "jpg"
+      : mediaType === "image/webp"
+        ? "webp"
+        : mediaType === "image/avif"
+          ? "avif"
+          : requestedFormat === "jpeg" || requestedFormat === "jpg"
+            ? "jpg"
+            : requestedFormat === "webp"
+              ? "webp"
+              : requestedFormat === "svg"
+                ? "svg"
+                : "png";
+  const mime = mediaType || (format === "svg"
+    ? "image/svg+xml"
+    : format === "jpg"
+      ? "image/jpeg"
+      : format === "webp"
+        ? "image/webp"
+        : format === "avif"
+          ? "image/avif"
+          : "image/png");
+  return { mime, format };
+}
+
 /**
  * Core image generation handler — orchestrator only.
  * Provider-specific URL/headers/body/parse/normalize live in `./imageProviders/{id}.js`.
@@ -67,12 +97,11 @@ export async function handleImageGenerationCore({
         }
         if (b64) {
           const buf = Buffer.from(b64, "base64");
-          const fmt = (body.output_format || "png").toLowerCase();
-          const mime = fmt === "jpeg" || fmt === "jpg" ? "image/jpeg" : fmt === "webp" ? "image/webp" : "image/png";
+          const { mime, format } = imageOutputMetadata(first, body);
           return {
             success: true,
             response: new Response(buf, {
-              headers: { "Content-Type": mime, "Content-Disposition": `inline; filename="image.${fmt === "jpeg" ? "jpg" : fmt}"`, "Access-Control-Allow-Origin": "*" },
+              headers: { "Content-Type": mime, "Content-Disposition": `inline; filename="image.${format}"`, "Access-Control-Allow-Origin": "*" },
             }),
           };
         }
@@ -203,14 +232,13 @@ export async function handleImageGenerationCore({
     }
     if (b64) {
       const buf = Buffer.from(b64, "base64");
-      const fmt = (body.output_format || "png").toLowerCase();
-      const mime = fmt === "jpeg" || fmt === "jpg" ? "image/jpeg" : fmt === "webp" ? "image/webp" : "image/png";
+      const { mime, format } = imageOutputMetadata(first, body);
       return {
         success: true,
         response: new Response(buf, {
           headers: {
             "Content-Type": mime,
-            "Content-Disposition": `inline; filename="image.${fmt === "jpeg" ? "jpg" : fmt}"`,
+            "Content-Disposition": `inline; filename="image.${format}"`,
             "Access-Control-Allow-Origin": "*",
           },
         }),

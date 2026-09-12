@@ -12,11 +12,12 @@ import blackForestLabs from "./blackForestLabs.js";
 import runwayml from "./runwayml.js";
 import cloudflareAi from "./cloudflareAi.js";
 import antigravity from "./antigravity.js";
+import openrouter from "./openrouter.js";
 
 const ADAPTERS = {
   openai: createOpenAIAdapter("openai"),
   minimax: createOpenAIAdapter("minimax"),
-  openrouter: createOpenAIAdapter("openrouter"),
+  openrouter,
   recraft: createOpenAIAdapter("recraft"),
   "vercel-ai-gateway": createOpenAIAdapter("vercel-ai-gateway"),
   xai: createOpenAIAdapter("xai"),
