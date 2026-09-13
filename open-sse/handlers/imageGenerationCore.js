@@ -184,10 +184,32 @@ export async function handleImageGenerationCore({
   }
 
   if (!providerResponse.ok) {
-    const { statusCode, message } = await parseUpstreamError(providerResponse);
-    const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
-    log?.debug?.("IMAGE", `Provider error: ${errMsg}`);
-    return createErrorResult(statusCode, errMsg);
+    let { statusCode, message } = await parseUpstreamError(providerResponse);
+    if (statusCode === 400 && requestBody && typeof requestBody === "object" && requestBody.seed !== undefined && message.toLowerCase().includes("seed")) {
+      log?.debug?.("IMAGE", `Retrying ${provider} ${model} without unsupported seed parameter`);
+      delete requestBody.seed;
+      try {
+        const retryResponse = await fetch(url, {
+          method: "POST",
+          headers,
+          body: serializeRequestBody(requestBody),
+        });
+        if (retryResponse.ok) {
+          providerResponse = retryResponse;
+        } else {
+          const retryErr = await parseUpstreamError(retryResponse);
+          statusCode = retryErr.statusCode;
+          message = retryErr.message;
+        }
+      } catch (retryError) {
+        log?.debug?.("IMAGE", `Retry error: ${retryError.message}`);
+      }
+    }
+    if (!providerResponse.ok) {
+      const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
+      log?.debug?.("IMAGE", `Provider error: ${errMsg}`);
+      return createErrorResult(statusCode, errMsg);
+    }
   }
 
   // Parse provider response — adapter may override (codex SSE / async polling / binary)
