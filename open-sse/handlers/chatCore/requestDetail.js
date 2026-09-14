@@ -1,6 +1,8 @@
 import { saveRequestUsage, appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { COLORS } from "../../utils/stream.js";
 import { canonicalizeUsage } from "../../utils/usageTracking.js";
+import { buildUsageMeta, recordCost, recordUsage } from "../../services/executionReceipt.js";
+import { finalizeExecution } from "@/lib/execution/receiptStore.js";
 
 const OPTIONAL_PARAMS = [
   "temperature", "top_p", "top_k",
@@ -100,7 +102,7 @@ export function formatDoneLine({ usage, latency }) {
   return `DONE ${latency?.total ?? 0}ms${ttftStr} · ${inStr} · OUT ${outTok}`;
 }
 
-export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, label = "USAGE", silent = false }) {
+export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, label = "USAGE", silent = false, execution = null, status = "success" }) {
   if (!tokens || typeof tokens !== "object") return;
 
   const inTokens = tokens.input_tokens ?? tokens.prompt_tokens ?? 0;
@@ -121,6 +123,13 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
     completion_tokens: tokens.completion_tokens ?? tokens.output_tokens ?? 0
   };
 
+  const meta = execution ? buildUsageMeta(execution) : null;
+  if (execution) {
+    recordUsage(execution, normalized);
+    // The usage row is now being written (or already exists via dedupe) — a
+    // later failure branch must not double-write a durable summary.
+    execution.usageRecorded = true;
+  }
   saveRequestUsage({
     provider: provider || "unknown",
     model: model || "unknown",
@@ -128,6 +137,20 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
     timestamp: new Date().toISOString(),
     connectionId: connectionId || undefined,
     apiKey: apiKey || undefined,
-    endpoint: endpoint || null
+    endpoint: endpoint || null,
+    executionId: execution?.executionId || null,
+    traceId: execution?.heron?.trace_id || null,
+    status,
+    meta: meta ? { ...meta, status } : {},
+  }).then((resolved) => {
+    if (resolved && execution) {
+      // Unknown resolutions must not downgrade an already-truthful cost.
+      if (resolved.costState && resolved.costState !== "unknown") {
+        recordCost(execution, resolved.cost, resolved.costState);
+      }
+      // The provisional receipt may already be on disk; refresh it now that the
+      // cost/usage truth is known.
+      if (execution.receiptPersisted) finalizeExecution(execution).catch(() => {});
+    }
   }).catch(() => {});
 }

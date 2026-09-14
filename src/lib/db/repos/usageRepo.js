@@ -132,21 +132,39 @@ async function ensureRingInitialized() {
 }
 
 async function calculateCost(provider, model, tokens) {
-  if (!tokens || !provider || !model) return 0;
+  if (!tokens || !provider || !model) return { amount: 0, state: "unknown" };
+  const hasUsageBasis = ["prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "cached_tokens"]
+    .some((k) => Number(tokens[k]) > 0);
+  if (!hasUsageBasis) return { amount: 0, state: "unknown" };
   try {
     const { getPricingForModel } = await import("./pricingRepo.js");
     const pricing = await getPricingForModel(provider, model);
-    if (!pricing) return 0;
+    if (!pricing) return { amount: 0, state: "unknown" };
 
     // Delegate the actual math to the single source of truth (avoids the two
     // copies drifting apart — see open-sse/providers/pricing.js for the
     // cache-inclusive prompt_tokens convention this assumes).
     const { calculateCostFromTokens } = await import("open-sse/providers/pricing.js");
-    return calculateCostFromTokens(tokens, pricing);
+    return { amount: calculateCostFromTokens(tokens, pricing), state: "estimated" };
   } catch (e) {
     console.error("Error calculating cost:", e);
-    return 0;
+    return { amount: 0, state: "unknown" };
   }
+}
+
+// Cost truth states:
+//   known     — the provider told us the exact cost (entry.costState === "known")
+//   estimated — computed from the local pricing table
+//   zero      — genuinely zero (e.g. a free/unauth provider, caller asserts zero)
+//   unknown   — no pricing/no usage basis; a stored 0 must NOT read as "free"
+async function resolveCost(entry) {
+  if (entry.costState === "known" && Number.isFinite(Number(entry.cost))) {
+    return { amount: Number(entry.cost), state: "known" };
+  }
+  if (entry.costState === "zero") {
+    return { amount: Number(entry.cost) || 0, state: "zero" };
+  }
+  return calculateCost(entry.provider, entry.model, entry.tokens);
 }
 
 export function trackPendingRequest(model, provider, connectionId, started, error = false) {
@@ -243,7 +261,16 @@ export async function saveRequestUsage(entry) {
     const db = await getAdapter();
 
     if (!entry.timestamp) entry.timestamp = new Date().toISOString();
-    entry.cost = await calculateCost(entry.provider, entry.model, entry.tokens);
+    const costInfo = await resolveCost(entry);
+    entry.cost = costInfo.amount;
+    entry.costState = costInfo.state;
+
+    // Compact execution summary (Heron correlation, requested vs actual, seed
+    // truth, fallback count). Persisted so an execution can be found by
+    // execution_id / trace_id even when conversation observability is off.
+    const executionId = entry.executionId || entry.meta?.execution_id || null;
+    const traceId = entry.traceId || entry.meta?.heron?.trace_id || null;
+    const meta = { ...(entry.meta || {}), cost_state: costInfo.state };
 
     const tokens = entry.tokens || {};
     const promptTokens = tokens.prompt_tokens || tokens.input_tokens || 0;
@@ -255,18 +282,19 @@ export async function saveRequestUsage(entry) {
     // better-sqlite3 is sync → no JS yield mid-transaction → no race in same process.
     db.transaction(() => {
       const existing = db.get(
-        `SELECT id, endpoint FROM usageHistory
+        `SELECT id, endpoint, executionId FROM usageHistory
          WHERE timestamp = ?
            AND COALESCE(provider, '') = COALESCE(?, '')
            AND COALESCE(model, '') = COALESCE(?, '')
            AND COALESCE(connectionId, '') = COALESCE(?, '')
            AND COALESCE(apiKey, '') = COALESCE(?, '')
+           AND COALESCE(executionId, '') = COALESCE(?, '')
            AND promptTokens = ?
            AND completionTokens = ?
          ORDER BY id DESC LIMIT 1`,
         [
           entry.timestamp, entry.provider || null, entry.model || null,
-          entry.connectionId || null, entry.apiKey || null,
+          entry.connectionId || null, entry.apiKey || null, executionId,
           promptTokens, completionTokens,
         ]
       );
@@ -275,16 +303,22 @@ export async function saveRequestUsage(entry) {
         if (!existing.endpoint && entry.endpoint) {
           db.run(`UPDATE usageHistory SET endpoint = ? WHERE id = ?`, [entry.endpoint, existing.id]);
         }
+        // Backfill receipt lookup columns on an existing row (double-save path).
+        if (!existing.executionId && executionId) {
+          db.run(`UPDATE usageHistory SET executionId = ?, traceId = ?, meta = ? WHERE id = ?`, [
+            executionId, traceId, stringifyJson(meta), existing.id,
+          ]);
+        }
         return;
       }
 
       db.run(
-        `INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO usageHistory(timestamp, provider, model, connectionId, apiKey, endpoint, promptTokens, completionTokens, cost, status, tokens, meta, executionId, traceId) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           entry.timestamp, entry.provider || null, entry.model || null,
           entry.connectionId || null, entry.apiKey || null, entry.endpoint || null,
           promptTokens, completionTokens, entry.cost || 0, entry.status || "ok",
-          stringifyJson(tokens), stringifyJson({}),
+          stringifyJson(tokens), stringifyJson(meta), executionId, traceId,
         ]
       );
 
@@ -308,8 +342,10 @@ export async function saveRequestUsage(entry) {
       pushToRing(entry);
       scheduleStatsEvent("update", 250);
     }
+    return { cost: entry.cost, costState: entry.costState };
   } catch (e) {
     console.error("Failed to save usage stats:", e);
+    return null;
   }
 }
 
@@ -331,6 +367,60 @@ export async function getUsageHistory(filter = {}) {
     connectionId: r.connectionId, apiKeyMasked: maskApiKey(r.apiKey), endpoint: r.endpoint,
     cost: r.cost, status: r.status, tokens: parseJson(r.tokens, {}),
   }));
+}
+
+// ── Execution receipt lookup ─────────────────────────────────────────────
+// The compact summary lives in usageHistory.meta (always persisted); the
+// detailed receipt lives in requestDetails under the same execution_id.
+function mapExecutionRow(r) {
+  return {
+    executionId: r.executionId || null,
+    traceId: r.traceId || null,
+    timestamp: r.timestamp,
+    provider: r.provider || null,
+    model: r.model || null,
+    connectionId: r.connectionId || null,
+    endpoint: r.endpoint || null,
+    cost: typeof r.cost === "number" ? r.cost : 0,
+    status: r.status || null,
+    tokens: parseJson(r.tokens, {}),
+    meta: parseJson(r.meta, {}),
+    apiKeyMasked: maskApiKey(r.apiKey),
+  };
+}
+
+export async function getUsageRecordByExecutionId(executionId) {
+  if (!executionId) return null;
+  const db = await getAdapter();
+  const row = db.get(
+    `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, status, tokens, meta, executionId, traceId
+     FROM usageHistory WHERE executionId = ? ORDER BY id DESC LIMIT 1`,
+    [executionId]
+  );
+  return row ? mapExecutionRow(row) : null;
+}
+
+export async function getUsageRecordsByTraceId(traceId, limit = 20) {
+  if (!traceId) return [];
+  const db = await getAdapter();
+  const capped = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+  const rows = db.all(
+    `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, status, tokens, meta, executionId, traceId
+     FROM usageHistory WHERE traceId = ? ORDER BY id DESC LIMIT ?`,
+    [traceId, capped]
+  );
+  return rows.map(mapExecutionRow);
+}
+
+export async function getRecentExecutions(limit = 20) {
+  const db = await getAdapter();
+  const capped = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+  const rows = db.all(
+    `SELECT timestamp, provider, model, connectionId, apiKey, endpoint, cost, status, tokens, meta, executionId, traceId
+     FROM usageHistory WHERE executionId IS NOT NULL ORDER BY id DESC LIMIT ?`,
+    [capped]
+  );
+  return rows.map(mapExecutionRow);
 }
 
 function loadDaysInRange(adapter, maxDays) {

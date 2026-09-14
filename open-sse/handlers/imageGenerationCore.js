@@ -4,6 +4,10 @@ import { refreshWithRetry } from "../services/tokenRefresh.js";
 import { getExecutor } from "../executors/index.js";
 import { getImageAdapter } from "./imageProviders/index.js";
 import { urlToBase64 } from "./imageProviders/_base.js";
+import {
+  recordActual, recordEffectiveParams, snapshotParams, recordSeedApplication,
+  recordLatency,
+} from "../services/executionReceipt.js";
 
 function serializeRequestBody(requestBody) {
   if (typeof FormData !== "undefined" && requestBody instanceof FormData) return requestBody;
@@ -65,8 +69,19 @@ export async function handleImageGenerationCore({
   binaryOutput = false,
   onCredentialsRefreshed,
   onRequestSuccess,
+  execution = null,
 }) {
   const { provider, model } = modelInfo;
+
+  if (execution) {
+    recordActual(execution, {
+      provider,
+      model,
+      connectionId: credentials?.connectionId || null,
+      connectionLabel: credentials?.connectionName || null,
+      authType: credentials?.authType || null,
+    });
+  }
 
   if (!body.prompt) {
     return createErrorResult(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
@@ -84,7 +99,28 @@ export async function handleImageGenerationCore({
   if (adapter.useExecutor && adapter.executeViaExecutor) {
     try {
       log?.debug?.("IMAGE", `${provider.toUpperCase()} | ${model} | prompt="${body.prompt.slice(0, 50)}..." (executor)`);
-      const responseBody = await adapter.executeViaExecutor(model, body, credentials, log);
+      const executeStart = Date.now();
+      const result = await adapter.executeViaExecutor(model, body, credentials, log);
+      // Adapters may hand back the request body they actually sent upstream so
+      // the receipt can diff requested vs effective truthfully. Fall back to
+      // the original body only when the adapter did not report one.
+      const sentBody = result && typeof result === "object" && !Array.isArray(result) && "body" in result ? result.body : body;
+      const responseBody = result && typeof result === "object" && !Array.isArray(result) && "response" in result ? result.response : result;
+      if (execution) {
+        recordLatency(execution, { upstream_ms: Date.now() - executeStart, routing_ms: null });
+        // Effective params come from what the adapter actually sent, never the
+        // original request: the antigravity executor adapter builds its own
+        // envelope from prompt/image and does NOT forward seed/n/size.
+        recordEffectiveParams(execution, snapshotParams(sentBody, { capability: "image" }));
+        if (body.seed !== undefined && body.seed !== null) {
+          const sentSeed = sentBody && typeof sentBody === "object" ? sentBody.seed : undefined;
+          recordSeedApplication(execution, {
+            requested: body.seed,
+            applied: sentSeed !== undefined && sentSeed !== null,
+            reason: sentSeed === undefined ? "adapter_dropped_seed" : "seed_forwarded",
+          });
+        }
+      }
       if (onRequestSuccess) await onRequestSuccess();
       const normalized = adapter.normalize(responseBody, body.prompt);
       const finalBody = (normalized.created && Array.isArray(normalized.data)) ? normalized : responseBody;
@@ -132,9 +168,25 @@ export async function handleImageGenerationCore({
     return createErrorResult(HTTP_STATUS.BAD_REQUEST, error.message || `Invalid ${provider} image request`);
   }
 
+  // Truthful effective parameters: what we actually sent upstream (never the
+  // sole copy of the original request — `body` is preserved untouched).
+  if (execution) {
+    recordEffectiveParams(execution, snapshotParams(requestBody, { capability: "image" }));
+    const requestedSeed = body.seed;
+    if (requestedSeed !== undefined && requestedSeed !== null) {
+      const sentSeed = requestBody && typeof requestBody === "object" ? requestBody.seed : undefined;
+      recordSeedApplication(execution, {
+        requested: requestedSeed,
+        applied: sentSeed !== undefined && sentSeed !== null,
+        reason: sentSeed === undefined ? "adapter_dropped_seed" : "seed_forwarded",
+      });
+    }
+  }
+
   log?.debug?.("IMAGE", `${provider.toUpperCase()} | ${model} | prompt="${body.prompt.slice(0, 50)}..."`);
 
   let providerResponse;
+  const executeStart = Date.now();
   try {
     providerResponse = await fetch(url, {
       method: "POST",
@@ -187,7 +239,19 @@ export async function handleImageGenerationCore({
     let { statusCode, message } = await parseUpstreamError(providerResponse);
     if (statusCode === 400 && requestBody && typeof requestBody === "object" && requestBody.seed !== undefined && message.toLowerCase().includes("seed")) {
       log?.debug?.("IMAGE", `Retrying ${provider} ${model} without unsupported seed parameter`);
+      // Truth: the requested seed was NOT applied; the retry ran mutated.
+      const requestedSeed = requestBody.seed;
       delete requestBody.seed;
+      const attemptNo = execution?.attempts?.length || 1;
+      if (execution) {
+        recordSeedApplication(execution, {
+          requested: requestedSeed,
+          applied: false,
+          attempt: attemptNo,
+          reason: "upstream_rejected_parameter",
+          detail: `provider returned 400 mentioning seed; compatibility retry ${attemptNo}`,
+        });
+      }
       try {
         const retryResponse = await fetch(url, {
           method: "POST",
@@ -206,11 +270,14 @@ export async function handleImageGenerationCore({
       }
     }
     if (!providerResponse.ok) {
+      if (execution) recordLatency(execution, { upstream_ms: Date.now() - executeStart });
       const errMsg = formatProviderError(new Error(message), provider, model, statusCode);
       log?.debug?.("IMAGE", `Provider error: ${errMsg}`);
       return createErrorResult(statusCode, errMsg);
     }
   }
+
+  recordLatency(execution, { upstream_ms: Date.now() - executeStart });
 
   // Parse provider response — adapter may override (codex SSE / async polling / binary)
   let parsed;

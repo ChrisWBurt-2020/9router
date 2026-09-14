@@ -27,6 +27,8 @@ export default {
   buildHeaders: () => ({}),
   buildBody: () => ({}),
 
+  // Returns { body, response } so the execution receipt can diff the request
+  // actually sent upstream (seed/n/size are NOT forwarded by this adapter).
   async executeViaExecutor(model, body, credentials, log) {
     const executor = getExecutor("antigravity");
     if (!executor) throw new Error("Antigravity executor not found");
@@ -69,7 +71,7 @@ export default {
       throw new Error(text || `HTTP ${result.response.status}`);
     }
 
-    return result.response.json();
+    return { body: { ...chatBody, model: targetModel }, response: await result.response.json() };
   },
 
   normalize: (responseBody, prompt) => {

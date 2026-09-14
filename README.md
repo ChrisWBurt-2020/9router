@@ -1252,6 +1252,20 @@ launcher, a `9router.desktop` menu entry and the icon, then enables and starts t
 service. Re-run it after a rebuild; remove everything with
 `scripts/install-linux-desktop.sh --uninstall`.
 
+**Exposure is loopback-only by default** (`127.0.0.1`) — the gateway never binds
+to the world unless you ask for it. Choose an explicit mode with `--expose`:
+
+```bash
+scripts/install-linux-desktop.sh                  # loopback only (default)
+scripts/install-linux-desktop.sh --expose lan     # 0.0.0.0 (any interface — pair with requireApiKey)
+scripts/install-linux-desktop.sh --expose tailnet # bind the Tailscale IP (tailscale must be up)
+```
+
+`scripts/install-linux-desktop.sh --print-bind [--expose MODE]` prints the resolved
+bind host without touching anything — useful for checking what a mode will bind.
+The desktop launcher and its health check run against the loopback (or tailnet)
+address, so they never force a broad `0.0.0.0` bind.
+
 ### Docker
 
 Published images (multi-platform `linux/amd64` + `linux/arm64`):

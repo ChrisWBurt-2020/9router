@@ -102,6 +102,11 @@ async function flushToDatabase() {
           if (!item.timestamp) item.timestamp = new Date().toISOString();
           if (item.request?.headers) item.request.headers = sanitizeHeaders(item.request.headers);
 
+          // Execution receipts are provenance, not conversation content. A
+          // receipt-only record carries no prompts/responses and is therefore
+          // persisted even when body observability is disabled. Its id is the
+          // execution_id, so lookup is a direct primary-key read.
+          const receiptOnly = item.receiptOnly === true;
           const record = {
             id: item.id,
             provider: item.provider || null,
@@ -111,10 +116,11 @@ async function flushToDatabase() {
             status: item.status || null,
             latency: item.latency || {},
             tokens: item.tokens || {},
-            request: truncateField(item.request, config.maxJsonSize),
-            providerRequest: truncateField(item.providerRequest, config.maxJsonSize),
-            providerResponse: truncateField(item.providerResponse, config.maxJsonSize),
-            response: truncateField(item.response, config.maxJsonSize),
+            request: receiptOnly ? undefined : truncateField(item.request, config.maxJsonSize),
+            providerRequest: receiptOnly ? undefined : truncateField(item.providerRequest, config.maxJsonSize),
+            providerResponse: receiptOnly ? undefined : truncateField(item.providerResponse, config.maxJsonSize),
+            response: receiptOnly ? undefined : truncateField(item.response, config.maxJsonSize),
+            receipt: item.receipt || undefined,
             pxpipe: item.pxpipe || undefined,
           };
 
@@ -142,7 +148,9 @@ async function flushToDatabase() {
 
 export async function saveRequestDetail(detail) {
   const config = await getObservabilityConfig();
-  if (!config.enabled) {return;}
+  // Body observability is opt-in, but execution receipts (receiptOnly) are
+  // always persisted — they contain no prompts or responses.
+  if (!config.enabled && detail.receiptOnly !== true) {return;}
 
   writeBuffer.push(detail);
 
@@ -202,6 +210,35 @@ export async function getRequestDetailById(id) {
   const db = await getAdapter();
   const row = db.get(`SELECT data FROM requestDetails WHERE id = ?`, [id]);
   return row ? parseJson(row.data, null) : null;
+}
+
+/**
+ * Find execution receipts (stored under requestDetails.data.receipt) by a
+ * Heron trace id. requestDetails is a bounded store (maxRecords), so a LIKE
+ * scan of the small table is acceptable; the exact JSON key avoids false hits.
+ * Used to make trace lookup complete for executions that never wrote a
+ * usageHistory row (e.g. failed/aborted chat requests).
+ */
+export async function getReceiptsByTraceId(traceId, limit = 20) {
+  if (!traceId) return [];
+  const db = await getAdapter();
+  const capped = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+  const esc = String(traceId).replace(/[\\%_]/g, (c) => `\\${c}`);
+  const rows = db.all(
+    `SELECT data FROM requestDetails WHERE data LIKE ? ESCAPE '\\' ORDER BY timestamp DESC LIMIT ?`,
+    [`%"trace_id":"${esc}"%`, capped]
+  );
+  return rows
+    .map((r) => parseJson(r.data, {}))
+    .filter((d) => d?.receipt)
+    .map((d) => d.receipt);
+}
+
+// Force the pending write buffer to disk. Used before a receipt lookup so an
+// execution started microseconds ago is already queryable.
+export async function flushRequestDetails() {
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  await flushToDatabase();
 }
 
 const _shutdownHandler = async () => {

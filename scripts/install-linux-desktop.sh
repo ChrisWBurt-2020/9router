@@ -11,8 +11,19 @@
 # after a rebuild or a config change to refresh the generated files.
 #
 # Usage:
-#   scripts/install-linux-desktop.sh              # install / update
-#   scripts/install-linux-desktop.sh --uninstall  # remove service + menu entry
+#   scripts/install-linux-desktop.sh [--expose MODE]   # install / update
+#   scripts/install-linux-desktop.sh --uninstall       # remove service + menu entry
+#   scripts/install-linux-desktop.sh --print-bind [--expose MODE]  # print bind host, exit
+#
+# Exposure modes (SECURITY: the default is loopback only — 9Router never binds
+# to the world unless you ask for it):
+#   loopback  — bind 127.0.0.1 (default). Only this machine can reach it.
+#   tailnet   — bind the machine's Tailscale IPv4 (tailscale must be up).
+#   lan       — bind 0.0.0.0 (any interface). Anyone who can reach this host
+#               can attempt to use the gateway; pair with requireApiKey.
+#
+# The desktop launcher and health check run against the loopback (or, for
+# tailnet mode, the tailnet) address, so they never force a broad bind.
 
 set -euo pipefail
 
@@ -33,7 +44,62 @@ DESKTOP_FILE="${APPS_DIR}/9router.desktop"
 ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
 ICON_FILE="${ICON_DIR}/9router.svg"
 
+EXPOSE_MODE="loopback"
+
 die() { echo "Error: $*" >&2; exit 1; }
+
+# ── Argument parsing ───────────────────────────────────────────────────────
+PRINT_BIND=""
+UNINSTALL=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --uninstall)
+      UNINSTALL="1"; shift
+      ;;
+    --expose)
+      [[ $# -gt 1 ]] || die "--expose requires loopback|tailnet|lan"
+      EXPOSE_MODE="$2"; shift 2
+      ;;
+    --print-bind)
+      PRINT_BIND="1"; shift
+      ;;
+    *)
+      die "Unknown argument: $1"
+      ;;
+  esac
+done
+
+case "$EXPOSE_MODE" in
+  loopback|tailnet|lan) ;;
+  *) die "Invalid --expose mode '$EXPOSE_MODE' (expected loopback|tailnet|lan)" ;;
+esac
+
+# Resolve the bind host for the chosen exposure mode.
+# Returns: "<bind_host>|<check_host>|<human_url_host>"
+resolve_bind() {
+  case "$EXPOSE_MODE" in
+    loopback)
+      echo "127.0.0.1|127.0.0.1|127.0.0.1"
+      ;;
+    lan)
+      echo "0.0.0.0|127.0.0.1|127.0.0.1"
+      ;;
+    tailnet)
+      local ip
+      ip="$(command -v tailscale >/dev/null 2>&1 && tailscale ip -4 2>/dev/null | head -n1 || true)"
+      [[ -n "${ip}" ]] || die "tailnet mode needs Tailscale running: could not resolve 'tailscale ip -4'. Install/enable Tailscale first, or use --expose loopback."
+      echo "${ip}|${ip}|${ip}"
+      ;;
+  esac
+}
+
+IFS='|' read -r BIND_HOST CHECK_HOST HUMAN_HOST <<< "$(resolve_bind)"
+
+# Early, side-effect-free mode that lets tests (and users) see the resolved bind.
+if [[ -n "${PRINT_BIND}" ]]; then
+  echo "${BIND_HOST}"
+  exit 0
+fi
 
 refresh_menus() {
   systemctl --user daemon-reload 2>/dev/null || true
@@ -50,7 +116,7 @@ uninstall() {
 
 [[ "$(uname -s)" == "Linux" ]] || die "This installer targets Linux (systemd --user)."
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+if [[ -n "${UNINSTALL}" ]]; then
   uninstall
   exit 0
 fi
@@ -66,14 +132,13 @@ NODE_BIN="$(node -e 'process.stdout.write(process.execPath)' 2>/dev/null || true
 
 PORT="$(sed -n 's/^PORT=\([0-9]\{1,\}\).*/\1/p' "${ENV_FILE}" | tail -n1)"
 PORT="${PORT:-20128}"
-APP_URL="http://127.0.0.1:${PORT}"
+APP_URL="http://${CHECK_HOST}:${PORT}"
 DASHBOARD_URL="${APP_URL}/dashboard"
 
 mkdir -p "${UNIT_DIR}" "${BIN_DIR}" "${APPS_DIR}" "${ICON_DIR}"
 
-# Bind 0.0.0.0 so the dashboard is reachable on loopback (used by 9router-web
-# and the app menu) as well as any LAN/Tailscale address. A concrete-IP HOSTNAME
-# here breaks the loopback health check in the launcher.
+# SECURITY: bind only the resolved host (loopback by default). The launcher and
+# health check use the same host, so nothing forces a 0.0.0.0 bind.
 cat > "${UNIT_PATH}" <<EOF
 [Unit]
 Description=9Router AI routing gateway + dashboard
@@ -83,7 +148,7 @@ After=network.target
 Type=simple
 WorkingDirectory=${STANDALONE_DIR}
 EnvironmentFile=${ENV_FILE}
-Environment=HOSTNAME=0.0.0.0
+Environment=HOSTNAME=${BIND_HOST}
 ExecStart=${NODE_BIN} ${STANDALONE_DIR}/custom-server.js
 Restart=on-failure
 RestartSec=3
@@ -103,6 +168,7 @@ set -euo pipefail
 APP_URL="${APP_URL}"
 DASHBOARD_URL="${DASHBOARD_URL}"
 UNIT="${UNIT_NAME}"
+CHECK_HOST="${CHECK_HOST}"
 
 action="\${1:-}"
 
@@ -203,5 +269,6 @@ refresh_menus
 
 echo "9Router installed."
 echo "  Service:   ${UNIT_NAME} (systemd --user, enabled)"
+echo "  Exposure:  ${EXPOSE_MODE} (bind ${BIND_HOST})"
 echo "  Dashboard: ${DASHBOARD_URL}"
 echo "  App menu:  9Router"

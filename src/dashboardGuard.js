@@ -87,6 +87,11 @@ const LOCAL_ONLY_PATHS = [
   "/api/headroom/proxy",
 ];
 
+// Authenticated read-only APIs that an API-key client (not just a dashboard
+// session) may call. Execution receipts are on this list so a caller can
+// inspect what actually executed using the same API key it used to request it.
+const API_KEY_READ_PATHS = ["/api/executions"];
+
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 // Accepts a Host header, a URL hostname or a raw socket address. Splitting on the first
@@ -219,6 +224,14 @@ export async function proxy(request) {
   if (isPublicLlmApi(pathname)) {
     if (await canAccessPublicLlmApi(request)) return NextResponse.next();
     return NextResponse.json({ error: "API key required for remote API access" }, { status: 401 });
+  }
+
+  // Read-only observability: API key, CLI token, or dashboard session.
+  if (API_KEY_READ_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`))) {
+    if (await hasValidApiKey(request) || await hasValidCliToken(request) || await isAuthenticated(request)) {
+      return NextResponse.next();
+    }
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   // Deny-by-default for /api/* — public allow-list bypasses, everything else requires auth.

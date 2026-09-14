@@ -1,3 +1,25 @@
+# v0.5.76 (unreleased)
+
+## Features
+- **Execution receipts**: every request routed through the gateway is captured as
+  a versioned, causal receipt — requested vs effective model/params, ordered
+  retry/fallback chain, compatibility mutations (with truthful image-seed
+  handling), latency, token usage and explicit cost state (`known|estimated|zero|unknown`,
+  never a silent "free"). Heron trace/intent/work/world ids are accepted from
+  headers and `metadata`, stripped before forwarding, echoed on responses, and
+  never treated as authorization. Durable lookup by `execution_id`/`trace_id`
+  via the existing `usageHistory` (indexed columns + `meta`) and `requestDetails`
+  stores, plus a read-only `/api/executions` surface. See
+  `docs/EXECUTION_RECEIPTS.md`.
+- **Linux installer**: the systemd service now binds **loopback-only by default**
+  (`127.0.0.1`). Explicit `--expose lan|tailnet` opts into a broader bind; the
+  desktop launcher/health-check no longer forces `0.0.0.0`. `--print-bind`
+  shows the resolved bind without side effects.
+
+## Fixes
+- **Usage**: `usageHistory.meta` now meaningfully persists the supplied
+  execution metadata instead of always writing `{}`.
+
 # v0.5.75 (2026-09-10)
 
 ## Features

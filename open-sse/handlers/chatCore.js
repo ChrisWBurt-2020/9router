@@ -30,6 +30,12 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { defaultClaudeToolType, shouldDefaultClaudeToolType } from "../translator/concerns/toolCall.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import {
+  setStreaming, recordActual, recordEffectiveParams, snapshotParams,
+  beginAttempt, endAttempt, recordOptimization, sanitizeConnectionIdentity,
+  recordLatency,
+} from "../services/executionReceipt.js";
+import { completeExecution, recordExecutionUsage } from "@/lib/execution/receiptStore.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -58,7 +64,7 @@ export function stripContinuityFields(body) {
   return body;
 }
 
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, headroomTimeoutMs, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, pxpipeEnabled, pxpipeMinChars, pxpipeTimeoutMs, pxpipeTransform, onPxpipeEvent, sourceFormatOverride, providerThinking, execution = null }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
   // Stable per-session color so all lines of one CLI conversation share a tag
@@ -140,6 +146,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   if (clientPrefersJson && !clientPrefersSSE && body.stream !== true && !providerRequiresStreaming) {
     stream = false;
   }
+  setStreaming(execution, stream);
 
   const reqLogger = await createRequestLogger(sourceFormat, targetFormat, model);
   if (clientRawRequest) reqLogger.logClientRawRequest(clientRawRequest.endpoint, clientRawRequest.body, clientRawRequest.headers);
@@ -305,6 +312,20 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // system/tools/messages, and a stale anchor costs a full prefix rewrite.
   if (passthrough && clientTool === "claude") anchorClaudeCache(translatedBody);
 
+  // Execution receipt: record the effective (post-translation) parameters and
+  // any requested→effective difference. The seed case is the canonical
+  // compatibility mutation: a dropped seed means determinism was not honored.
+  if (execution) {
+    recordEffectiveParams(execution, snapshotParams(translatedBody, { capability: "chat" }));
+    if (rtkStats?.enabled && (rtkStats.toolResultsCompressed || rtkStats.tokensSaved)) {
+      recordOptimization(execution, { name: "rtk", detail: `tool_results=${rtkStats.toolResultsCompressed || 0}` });
+    }
+    if (headroomStats?.applied) recordOptimization(execution, { name: "headroom" });
+    if (pxpipeSummary?.applied) recordOptimization(execution, { name: "pxpipe", detail: `images=${pxpipeSummary.imageCount}` });
+    if (tokenSaverEnabled && cavemanEnabled && cavemanLevel) recordOptimization(execution, { name: "caveman", detail: cavemanLevel });
+    if (tokenSaverEnabled && ponytailEnabled && ponytailLevel) recordOptimization(execution, { name: "ponytail", detail: ponytailLevel });
+  }
+
   const executor = getExecutor(provider);
   trackPendingRequest(model, provider, connectionId, true);
   appendRequestLog({ model, provider, connectionId, status: "PENDING" }).catch(() => { });
@@ -315,9 +336,21 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const streamController = createStreamController({
     onDisconnect: (reason) => {
       trackPendingRequest(model, provider, connectionId, false);
+      completeExecution(execution, { status: "aborted", error: reason || "client disconnected" }).catch(() => {});
+      recordExecutionUsage(execution, {
+        provider, model, connectionId, apiKey, endpoint: clientRawRequest?.endpoint,
+        status: "aborted", tokens: {},
+      }).catch(() => {});
       if (onDisconnect) onDisconnect(reason);
     },
-    onError: () => trackPendingRequest(model, provider, connectionId, false),
+    onError: (error) => {
+      trackPendingRequest(model, provider, connectionId, false);
+      completeExecution(execution, { status: "error", error: error?.message || "stream error" }).catch(() => {});
+      recordExecutionUsage(execution, {
+        provider, model, connectionId, apiKey, endpoint: clientRawRequest?.endpoint,
+        status: "error", tokens: {},
+      }).catch(() => {});
+    },
     log, provider, model, reqTag
   });
 
@@ -359,6 +392,14 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   // Most executors return their registry format. Cursor AgentService is an
   // exception: it is decoded by the executor into OpenAI-compatible output.
   let providerResponseFormat = targetFormat;
+  recordActual(execution, {
+    provider,
+    model,
+    connectionId: credentials?.connectionId || connectionId || null,
+    connectionLabel: credentials?.connectionName || null,
+    authType: credentials?.authType || null,
+  });
+  const executeStart = Date.now();
   try {
     const result = await executor.execute({
       model,
@@ -376,8 +417,12 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     providerHeaders = result.headers;
     finalBody = result.transformedBody;
     providerResponseFormat = result.responseFormat || targetFormat;
+    const upstreamMs = Date.now() - executeStart;
+    recordLatency(execution, { upstream_ms: upstreamMs });
+    if (execution?.currentAttempt) execution.currentAttempt.upstream_ms = upstreamMs;
     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
   } catch (error) {
+    recordLatency(execution, { upstream_ms: Date.now() - executeStart });
     trackPendingRequest(model, provider, connectionId, false, true);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
@@ -423,6 +468,13 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
         if (onCredentialsRefreshed) {
           try { await onCredentialsRefreshed(newCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
         }
+        const refreshAttempt = beginAttempt(execution, {
+          reason: "token_refresh_retry",
+          provider,
+          model,
+          connection: sanitizeConnectionIdentity(credentials),
+        });
+        const retryStart = Date.now();
         try {
           const retryResult = await executor.execute({
             model,
@@ -435,12 +487,22 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
             log,
             proxyOptions,
           });
+          endAttempt(execution, refreshAttempt, {
+            success: retryResult.response.ok,
+            status: retryResult.response.status,
+            error: retryResult.response.ok ? null : retryResult.response.statusText,
+          });
+          if (refreshAttempt) refreshAttempt.upstream_ms = Date.now() - retryStart;
           if (retryResult.response.ok) {
             providerResponse = retryResult.response;
             providerUrl = retryResult.url;
             providerResponseFormat = retryResult.responseFormat || targetFormat;
           }
-        } catch { log?.warn?.("TOKEN", `${provider.toUpperCase()} | retry after refresh failed`); }
+        } catch (e) {
+          endAttempt(execution, refreshAttempt, { success: false, error: e.message });
+          if (refreshAttempt) refreshAttempt.upstream_ms = Date.now() - retryStart;
+          log?.warn?.("TOKEN", `${provider.toUpperCase()} | retry after refresh failed: ${e.message}`);
+        }
       } else {
         log?.warn?.("TOKEN", `${provider.toUpperCase()} | refresh failed`);
       }
@@ -474,7 +536,7 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     return createErrorResult(statusCode, errMsg, resetsAtMs);
   }
 
-  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log };
+  const sharedCtx = { provider, model, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, pxpipe: pxpipeSummary, reqTag, log, execution };
   const appendLog = (extra) => appendRequestLog({ model, provider, connectionId, ...extra }).catch(() => { });
   const trackDone = () => trackPendingRequest(model, provider, connectionId, false);
 
