@@ -16,6 +16,9 @@ describe("local image adapters", () => {
     expect(request.prompt["7"].inputs.seed).toBe(7);
     expect(request.prompt["6"].inputs.width).toBe(1024);
 
+    const discovered = adapter.buildBody("comfyui/actual-checkpoint.safetensors", { prompt: "a heron" });
+    expect(discovered.prompt["3"].inputs.ckpt_name).toBe("actual-checkpoint.safetensors");
+
     vi.useFakeTimers();
     global.fetch = vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ "job-1": { outputs: {

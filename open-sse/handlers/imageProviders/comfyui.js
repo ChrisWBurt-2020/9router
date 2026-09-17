@@ -13,7 +13,10 @@ function dimensions(body) {
 
 function defaultWorkflow(model, body) {
   const { width, height } = dimensions(body);
-  const checkpoint = body.checkpoint || process.env.COMFYUI_CHECKPOINT || (String(model).includes("sdxl") ? "sdxl_lightning_4step.safetensors" : "sdxl_lightning_4step.safetensors");
+  // Catalog IDs are namespaced for Heron/9Router, while ComfyUI expects the
+  // exact checkpoint filename returned by its live catalog.
+  const selected = body.checkpoint || model || process.env.COMFYUI_CHECKPOINT || "sdxl_lightning_4step.safetensors";
+  const checkpoint = String(selected).replace(/^comfyui\//i, "");
   const steps = Number(body.steps || 4);
   return {
     "3": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: checkpoint } },
