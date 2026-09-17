@@ -8,10 +8,18 @@ export default {
   noAuth: true,
   buildUrl: () => BASE_URL,
   buildHeaders: () => ({ "Content-Type": "application/json" }),
-  buildBody: (_model, body) => {
+  local: true,
+  estimatedCostUsd: 0,
+  buildBody: (model, body) => {
     const { prompt, n = 1, size = "1024x1024" } = body;
     const [width, height] = size.split("x").map(Number);
-    return { prompt, width: width || 512, height: height || 512, steps: 20, batch_size: n };
+    return {
+      prompt, width: width || 512, height: height || 512,
+      steps: Number(body.steps || 20), batch_size: n,
+      cfg_scale: Number(body.cfg || 7),
+      seed: body.seed === undefined ? -1 : Number(body.seed),
+      override_settings: { sd_model_checkpoint: body.checkpoint || model },
+    };
   },
   normalize: (responseBody) => {
     const images = Array.isArray(responseBody.images) ? responseBody.images.map((img) => ({ b64_json: img })) : [];

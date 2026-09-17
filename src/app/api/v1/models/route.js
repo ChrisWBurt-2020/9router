@@ -293,6 +293,44 @@ function comboMatchesKinds(combo, kindFilter) {
   return kindFilter.includes(kind);
 }
 
+async function localImageProviderAvailable(providerId) {
+  const url = providerId === "comfyui"
+    ? "http://localhost:8188/system_stats"
+    : "http://localhost:7860/sdapi/v1/sd-models";
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 800);
+    const response = await fetch(url, { method: "GET", signal: controller.signal, cache: "no-store" });
+    clearTimeout(timer);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function discoverLocalImageModels(providerId) {
+  const url = providerId === "comfyui"
+    ? "http://localhost:8188/object_info/CheckpointLoaderSimple"
+    : "http://localhost:7860/sdapi/v1/sd-models";
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 1200);
+    const response = await fetch(url, { method: "GET", signal: controller.signal, cache: "no-store" });
+    clearTimeout(timer);
+    if (!response.ok) return [];
+    const payload = await response.json();
+    if (providerId === "sdwebui") {
+      return Array.isArray(payload)
+        ? payload.map((item) => item?.model_name || item?.title).filter(Boolean)
+        : [];
+    }
+    const choices = payload?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0];
+    return Array.isArray(choices) ? choices.filter((item) => typeof item === "string" && item.trim()) : [];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Build OpenAI-format models list filtered by service kinds.
  * @param {string[]} kindFilter - List of service kinds to include (e.g. ["llm"], ["webSearch","webFetch"]).
@@ -345,6 +383,17 @@ export async function buildModelsList(kindFilter, options = {}) {
       activeConnectionByProvider.set(conn.provider, conn);
     }
   }
+  // Local image backends are transport providers, not credential records.
+  // Always expose their curated/live model surface to image clients; health
+  // is reported in the model metadata and generation will return a clear
+  // unavailable error when the backend is stopped.
+  if (kindFilter.includes("image")) {
+    for (const providerId of ["comfyui", "sdwebui"]) {
+      if (!activeConnectionByProvider.has(providerId)) {
+        activeConnectionByProvider.set(providerId, { provider: providerId, isActive: true, providerSpecificData: {} });
+      }
+    }
+  }
 
   const models = [];
 
@@ -384,6 +433,13 @@ export async function buildModelsList(kindFilter, options = {}) {
         if (kindFilter.includes("image") && modelKind(model) === "image") {
           if (model.name) modelEntry.name = model.name;
           modelEntry.kind = "image";
+          if (["comfyui", "sdwebui"].includes(providerId)) {
+            modelEntry.provider = providerId;
+            modelEntry.local = true;
+            modelEntry.available = await localImageProviderAvailable(providerId);
+            modelEntry.role = model.role || "local_standard";
+            modelEntry.estimated_cost_usd = 0;
+          }
           if (Array.isArray(model.params) && model.params.length) modelEntry.params = model.params;
           if (Array.isArray(model.capabilities) && model.capabilities.length) modelEntry.capabilities = model.capabilities;
           if (model.supportedParameters) modelEntry.supported_parameters = model.supportedParameters;
@@ -419,6 +475,9 @@ export async function buildModelsList(kindFilter, options = {}) {
         || staticAlias
       ).trim();
       const providerModels = PROVIDER_MODELS[staticAlias] || [];
+      const localAvailable = ["comfyui", "sdwebui"].includes(providerId)
+        ? await localImageProviderAvailable(providerId)
+        : null;
       const enabledModels = conn?.providerSpecificData?.enabledModels;
       const hasExplicitEnabledModels =
         Array.isArray(enabledModels) && enabledModels.length > 0;
@@ -443,6 +502,17 @@ export async function buildModelsList(kindFilter, options = {}) {
             ),
           )
         : providerModels.map((model) => model.id);
+
+      if (kindFilter.includes("image") && ["comfyui", "sdwebui"].includes(providerId)) {
+        const discovered = await discoverLocalImageModels(providerId);
+        if (discovered.length) {
+          rawModelIds = Array.from(new Set([...rawModelIds, ...discovered]));
+          for (const modelId of discovered) {
+            liveModelKindById.set(modelId, "image");
+            liveModelMetaById.set(modelId, { id: modelId, name: modelId, kind: "image" });
+          }
+        }
+      }
 
       if (isCompatibleProvider && rawModelIds.length === 0 && !skipDynamicFetch) {
         rawModelIds = await fetchCompatibleModelIds(conn);
@@ -576,9 +646,21 @@ export async function buildModelsList(kindFilter, options = {}) {
         if (kind === "image" && staticMeta) {
           if (staticMeta.name) model.name = staticMeta.name;
           model.kind = "image";
+          model.provider = outputAlias;
+          if (staticMeta.local !== undefined) model.local = Boolean(staticMeta.local);
+          if (localAvailable !== null) model.available = localAvailable;
+          if (staticMeta.role) model.role = staticMeta.role;
+          if (staticMeta.estimated_cost_usd !== undefined) model.estimated_cost_usd = Number(staticMeta.estimated_cost_usd) || 0;
           if (Array.isArray(staticMeta.params) && staticMeta.params.length) model.params = staticMeta.params;
           if (Array.isArray(staticMeta.capabilities) && staticMeta.capabilities.length) model.capabilities = staticMeta.capabilities;
           if (staticMeta.supportedParameters) model.supported_parameters = staticMeta.supportedParameters;
+        }
+        if (kind === "image" && ["comfyui", "sdwebui"].includes(providerId)) {
+          model.provider = providerId;
+          model.local = true;
+          model.available = localAvailable === true;
+          model.role = model.role || "local_standard";
+          if (model.estimated_cost_usd === undefined) model.estimated_cost_usd = 0;
         }
         const liveMeta = liveModelMetaById.get(modelId);
         if (liveMeta?.name) model.name = liveMeta.name;

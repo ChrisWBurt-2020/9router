@@ -12,9 +12,9 @@ export default {
   category: "apikey",
   transport: null,
   models: [
-    { id: "flux-dev", name: "FLUX Dev", params: ["n","size"], kind: "image" },
-    { id: "sdxl", name: "SDXL", params: ["n","size"], kind: "image" },
+    { id: "sdxl-lightning-4step", name: "SDXL Lightning 4-step", params: ["n","size","seed","workflow"], kind: "image", local: true, estimated_cost_usd: 0, role: "local_standard" },
+    { id: "flux-dev", name: "FLUX Dev", params: ["n","size","workflow"], kind: "image", local: true, estimated_cost_usd: 0, role: "local_standard" },
   ],
   serviceKinds: ["image"],
-  imageConfig: { baseUrl: "http://localhost:8188" },
+  imageConfig: { baseUrl: "http://localhost:8188", healthUrl: "http://localhost:8188/system_stats" },
 };
