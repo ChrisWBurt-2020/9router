@@ -18,22 +18,7 @@ of the same suite.
 ### B1 — Prove zero new failures
 
 ```bash
-# 1. Capture the CURRENT full-suite result first (before touching the tree).
-cd tests && npx vitest run --reporter=json --outputFile=/tmp/vitest-current.json
-
-# 2. Stash everything including untracked, run the same suite on the clean tree.
-git stash --include-untracked
-npx vitest run --reporter=json --outputFile=/tmp/vitest-clean.json
-git stash pop   # see B2 — this can fail
-
-# 3. Diff the failure SETS (ignore counts that shift by +new tests).
-node -e '
-const fs=require("fs");
-function fails(p){const r=JSON.parse(fs.readFileSync(p,"utf8"));const s=new Set();
-for(const f of r.testResults)for(const a of f.assertionResults)if(a.status==="failed"){
-  const i=f.name.indexOf("/tests/");const rel=i>=0?f.name.slice(i+7):f.name; s.add(rel+" :: "+a.fullName);}return s;}
-const c=fails("/tmp/vitest-clean.json"),n=fails("/tmp/vitest-current.json");
-console.log("clean",c.size,"current",n.size,"NEW",[...n].filter(x=>!c.has(x)).length);'
+npm run verify:no-regressions
 ```
 
 `NEW: 0` (current ⊇ clean's failure set) is the pass condition. Presence of the
@@ -44,28 +29,13 @@ moved; it is a snapshot, not an eternal truth.
 Never substitute a partial run (single file, one suite) as regression evidence —
 a partial run masks cross-file breakage.
 
-### B2 — After `git stash --include-untracked`, expect a pop collision
+### B2 — Preserve the dirty worktree
 
-Running the suite on the stashed tree regenerates untracked artifacts (snapshot
-files, DB dumps) that then collide with the stash on `pop`:
-
-```
-error: could not restore untracked files from stash
-```
-
-Recover: inspect what the stash actually holds, then drop it only when
-everything is on disk.
-
-```bash
-git stash show --include-untracked --name-only   # compare against git status
-# every file you created must appear BOTH here and on disk
-git stash drop
-```
-
-Do not `pop --force` or guess; a kept stash that was actually applied is safe
-to drop once the file lists match. Also: if a generated snapshot is not part of
-your slice, gitignore it (`docs/*` whitelist style) or delete it — otherwise
-`git status` never shows only your changes after the next suite run.
+The repository script creates a detached linked worktree at the current HEAD,
+shares installed dependencies when available, runs the same full suite there,
+compares failure sets, and removes only that temporary worktree. Do not use
+stash/pop for this gate: untracked artifacts can collide with restoration and
+the user's dirty tree must remain untouched.
 
 ### B3 — Test behaviour contradicts source you just edited: stale cache, not your bug
 

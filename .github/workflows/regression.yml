@@ -1,0 +1,22 @@
+name: regression
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  full-suite-failure-set:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm ci --prefix tests
+      - run: npm run verify:no-regressions
+
+# Administrators should configure this job's check as required in branch
+# protection/rulesets where policy permits. YAML creates the check; it cannot
+# change GitHub repository settings by itself.
