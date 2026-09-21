@@ -12,6 +12,9 @@ export default {
   category: "apikey",
   transport: null,
   models: [
+    { id: "local-fast-image", name: "Local Fast Image (role)", params: ["n","size","seed","workflow"], kind: "image", local: true, estimated_cost_usd: 0, role: "local_fast" },
+    { id: "local-quality-image", name: "Local Quality Image (role)", params: ["n","size","seed","workflow"], kind: "image", local: true, estimated_cost_usd: 0, role: "local_quality" },
+    { id: "local-edit-image", name: "Local Edit Image (role)", params: ["n","size","seed","workflow"], kind: "image", local: true, estimated_cost_usd: 0, role: "local_edit" },
     { id: "sdxl-lightning-4step", name: "SDXL Lightning 4-step", params: ["n","size","seed","workflow"], kind: "image", local: true, estimated_cost_usd: 0, role: "local_standard" },
     { id: "flux-dev", name: "FLUX Dev", params: ["n","size","workflow"], kind: "image", local: true, estimated_cost_usd: 0, role: "local_standard" },
   ],

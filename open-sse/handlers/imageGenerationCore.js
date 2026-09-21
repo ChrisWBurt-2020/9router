@@ -15,6 +15,14 @@ function serializeRequestBody(requestBody) {
   return JSON.stringify(requestBody);
 }
 
+function executionTruth(adapter, requestBody) {
+  try {
+    return adapter.getExecutionTruth?.(requestBody) || requestBody;
+  } catch {
+    return requestBody;
+  }
+}
+
 function imageOutputMetadata(first, body) {
   const mediaType = String(first?.media_type || first?.mime_type || "").toLowerCase().split(";", 1)[0];
   const requestedFormat = String(body?.output_format || "").toLowerCase();
@@ -111,9 +119,10 @@ export async function handleImageGenerationCore({
         // Effective params come from what the adapter actually sent, never the
         // original request: the antigravity executor adapter builds its own
         // envelope from prompt/image and does NOT forward seed/n/size.
-        recordEffectiveParams(execution, snapshotParams(sentBody, { capability: "image" }));
+        const truth = executionTruth(adapter, sentBody);
+        recordEffectiveParams(execution, snapshotParams({ ...sentBody, ...truth }, { capability: "image" }));
         if (body.seed !== undefined && body.seed !== null) {
-          const sentSeed = sentBody && typeof sentBody === "object" ? sentBody.seed : undefined;
+          const sentSeed = truth && typeof truth === "object" ? truth.seed : undefined;
           recordSeedApplication(execution, {
             requested: body.seed,
             applied: sentSeed !== undefined && sentSeed !== null,
@@ -171,10 +180,11 @@ export async function handleImageGenerationCore({
   // Truthful effective parameters: what we actually sent upstream (never the
   // sole copy of the original request — `body` is preserved untouched).
   if (execution) {
-    recordEffectiveParams(execution, snapshotParams(requestBody, { capability: "image" }));
+    const truth = executionTruth(adapter, requestBody);
+    recordEffectiveParams(execution, snapshotParams({ ...requestBody, ...truth }, { capability: "image" }));
     const requestedSeed = body.seed;
     if (requestedSeed !== undefined && requestedSeed !== null) {
-      const sentSeed = requestBody && typeof requestBody === "object" ? requestBody.seed : undefined;
+      const sentSeed = truth && typeof truth === "object" ? truth.seed : undefined;
       recordSeedApplication(execution, {
         requested: requestedSeed,
         applied: sentSeed !== undefined && sentSeed !== null,

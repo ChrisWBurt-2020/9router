@@ -18,6 +18,10 @@ describe("local image adapters", () => {
 
     const discovered = adapter.buildBody("comfyui/actual-checkpoint.safetensors", { prompt: "a heron" });
     expect(discovered.prompt["3"].inputs.ckpt_name).toBe("actual-checkpoint.safetensors");
+    expect(adapter.buildBody("sdxl-lightning-4step", { prompt: "a heron", seed: 0 }).prompt["7"].inputs.seed).toBe(0);
+    expect(adapter.buildBody("local-fast-image", { prompt: "a heron" }).prompt["3"].inputs.ckpt_name).toBe("sdxl_lightning_4step.safetensors");
+    expect(adapter.getExecutionTruth(request).seed).toBe(7);
+    expect(adapter.getExecutionTruth(request).checkpoint).toBe("sdxl_lightning_4step.safetensors");
 
     vi.useFakeTimers();
     global.fetch = vi.fn()
