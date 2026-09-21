@@ -15,12 +15,23 @@ import {
  *  - requestDetails (receipt-only records always persisted): the detailed
  *    receipt under `data.receipt`, keyed by the execution_id itself.
  *
- * Fail-open: persistence must never break an inference request.
+ * Fail-open: persistence must never break an inference request. The outcome
+ * is still recorded in memory and exposed through response headers/metrics.
  */
+
+const receiptPersistenceHealth = { persisted: 0, degraded: 0, failed: 0 };
+
+export function getReceiptPersistenceHealth() {
+  return { ...receiptPersistenceHealth };
+}
 
 export async function finalizeExecution(execution) {
   if (!execution) return null;
   try {
+    // Build the durable payload with the success state. If the write throws,
+    // the catch below changes only in-memory state because no receipt exists
+    // to update.
+    execution.evidenceStatus = "persisted";
     const receipt = buildExecutionReceipt(execution);
     await saveRequestDetail({
       id: execution.executionId,
@@ -33,8 +44,15 @@ export async function finalizeExecution(execution) {
       receipt,
     });
     execution.receiptPersisted = true;
+    receiptPersistenceHealth.persisted += 1;
     return receipt;
-  } catch {
+  } catch (error) {
+    execution.receiptPersisted = false;
+    execution.evidenceStatus = "failed";
+    receiptPersistenceHealth.failed += 1;
+    // This is deliberately a warning rather than a thrown request error: the
+    // inference result remains valid, but evidence durability is degraded.
+    console.warn?.(`[9router] receipt persistence failed for ${execution.executionId}: ${error?.message || error}`);
     return null;
   }
 }
@@ -96,6 +114,11 @@ export async function recordExecutionUsage(execution, {
     }
     return res;
   } catch {
+    if (execution) {
+      execution.evidenceStatus = "failed";
+      receiptPersistenceHealth.failed += 1;
+      console.warn?.(`[9router] usage persistence failed for ${execution.executionId}`);
+    }
     return null;
   }
 }

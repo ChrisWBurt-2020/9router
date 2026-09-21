@@ -33,6 +33,7 @@ export const HERON_METADATA_KEYS = {
   work_id: ["heron_work_id", "heronWorkId"],
   world_id: ["heron_world_id", "heronWorldId"],
 };
+export const RECEIPT_PERSISTENCE_HEADER = "X-9Router-Receipt-Persistence";
 
 const CORRELATION_MAX_LEN = 256;
 // Correlation ids are opaque but must be safe to persist/log: reject control
@@ -290,6 +291,7 @@ export function createExecution({
     connectionIdentity: connectionIdentity || null,
     usageRecorded: false,
     receiptPersisted: false,
+    evidenceStatus: "degraded",
   };
 }
 
@@ -323,6 +325,18 @@ export function beginAttempt(execution, info = {}) {
   else execution.attemptsTruncated += 1;
   execution.currentAttempt = attempt;
   return attempt;
+}
+
+function attemptCounters(attempts = []) {
+  const errors = attempts.filter((a) => a.status === "error");
+  return {
+    total_attempts: attempts.length,
+    model_fallbacks: errors.filter((a) => a.n > 1 && !/account_fallback|token_refresh|credential/i.test(String(a.reason || ""))).length,
+    account_fallbacks: errors.filter((a) => a.reason === "account_fallback").length,
+    token_refresh_retries: errors.filter((a) => /token_refresh|refresh/i.test(String(a.reason || ""))).length,
+    credential_failures: errors.filter((a) => /credential/i.test(String(a.reason || ""))).length,
+    fallback_count: errors.length,
+  };
 }
 
 export function endAttempt(execution, attempt, { success = false, status = null, error = null, startedAtMs = null } = {}) {
@@ -492,7 +506,7 @@ function seedTruth(execution) {
 export function buildExecutionReceipt(execution) {
   if (!execution) return null;
   const seed = seedTruth(execution);
-  const fallbacks = execution.attempts.filter((a) => a.status === "error").length;
+  const counters = attemptCounters(execution.attempts);
   return {
     schema_version: execution.schemaVersion,
     execution_id: execution.executionId,
@@ -502,6 +516,7 @@ export function buildExecutionReceipt(execution) {
     endpoint: execution.endpoint,
     capability: execution.capability,
     status: execution.status,
+    evidence_status: execution.evidenceStatus || "degraded",
     error: execution.error,
     heron: execution.heron
       ? {
@@ -524,7 +539,7 @@ export function buildExecutionReceipt(execution) {
       requested_combo: execution.requestedCombo,
       candidates: execution.routingCandidates,
       selected: execution.actual,
-      fallback_count: fallbacks,
+      ...counters,
     },
     attempts: execution.attempts.map((a) => ({
       n: a.n,
@@ -565,7 +580,7 @@ export function buildExecutionReceipt(execution) {
 export function buildUsageMeta(execution) {
   if (!execution) return null;
   const receipt = buildExecutionReceipt(execution);
-  const fallbacks = receipt.attempts.filter((a) => a.status === "error").length;
+  const counters = attemptCounters(receipt.attempts);
   return {
     schema_version: RECEIPT_SCHEMA_VERSION,
     execution_id: receipt.execution_id,
@@ -586,7 +601,9 @@ export function buildUsageMeta(execution) {
       : null,
     routing_reason: receipt.routing.reason,
     attempts: receipt.attempts.length + (receipt.attempts_truncated || 0),
-    fallbacks,
+    fallbacks: counters.fallback_count,
+    ...counters,
+    evidence_status: receipt.evidence_status,
     compatibility_mutations: receipt.compatibility_mutations,
     determinism: receipt.determinism,
     status: receipt.status,
@@ -600,6 +617,7 @@ export function executionResponseHeaders(execution) {
   if (!execution) return {};
   const headers = { [EXECUTION_ID_HEADER]: execution.executionId };
   if (execution.heron?.trace_id) headers[HERON_TRACE_HEADER] = execution.heron.trace_id;
+  if (execution.evidenceStatus) headers[RECEIPT_PERSISTENCE_HEADER] = execution.evidenceStatus;
   return headers;
 }
 
@@ -614,7 +632,7 @@ export function attachExecutionHeaders(response, execution) {
     for (const [k, v] of Object.entries(executionResponseHeaders(execution))) headers.set(k, v);
     const existingExpose = headers.get("Access-Control-Expose-Headers");
     const expose = new Set(
-      [EXECUTION_ID_HEADER, HERON_TRACE_HEADER, ...(existingExpose ? existingExpose.split(",").map((s) => s.trim()) : [])]
+      [EXECUTION_ID_HEADER, HERON_TRACE_HEADER, RECEIPT_PERSISTENCE_HEADER, ...(existingExpose ? existingExpose.split(",").map((s) => s.trim()) : [])]
         .filter(Boolean)
     );
     headers.set("Access-Control-Expose-Headers", [...expose].join(", "));
