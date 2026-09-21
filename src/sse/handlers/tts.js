@@ -2,8 +2,8 @@ import {
   extractApiKey, isValidApiKey,
   getProviderCredentials, markAccountUnavailable,
 } from "../services/auth.js";
-import { getSettings } from "@/lib/localDb";
-import { getModelInfo, getComboModels } from "../services/model.js";
+import { getSettings, getComboByName } from "@/lib/localDb";
+import { getModelInfo } from "../services/model.js";
 import { handleTtsCore } from "open-sse/handlers/ttsCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
@@ -114,8 +114,10 @@ async function handleTtsWithExecution(request, body, execution) {
   if (!body.input) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
 
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
-  const comboModels = await getComboModels(modelStr);
+  const comboRow = modelStr.includes("/") ? null : await getComboByName(modelStr);
+  const comboModels = comboRow?.models?.length ? comboRow.models : null;
   if (comboModels) {
+    const freeTierOnly = comboRow.kind === "free-tier";
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
@@ -129,6 +131,7 @@ async function handleTtsWithExecution(request, body, execution) {
       comboName: modelStr,
       comboStrategy,
       comboStickyLimit,
+      freeTierOnly,
     });
   }
 

@@ -6,6 +6,22 @@ import { checkFallbackError, formatRetryAfter } from "./accountFallback.js";
 import { unavailableResponse } from "../utils/error.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { extractTextContent } from "../translator/formats/gemini.js";
+import { isFreeModelId } from "../config/freeModels.js";
+
+export { isFreeModelId } from "../config/freeModels.js";
+
+export function filterFreeTierModels(models) {
+  return Array.isArray(models) ? models.filter(isFreeModelId) : [];
+}
+
+function freeTierUnavailableResponse(comboName) {
+  return new Response(
+    JSON.stringify({
+      error: { message: `No compatible free models available${comboName ? ` in combo "${comboName}"` : ""}. This combo is free-tier only; refusing a paid fallback.` },
+    }),
+    { status: 503, headers: { "Content-Type": "application/json" } }
+  );
+}
 
 // Hard capabilities = input modalities; missing one drops request data (e.g. image
 // stripped). Must be prioritized. Soft (e.g. search) only degrades a feature.
@@ -275,9 +291,28 @@ export function getComboModelsFromData(modelStr, combosData) {
  * @param {string} [options.comboName] - Name of the combo (for round-robin tracking)
  * @param {string} [options.comboStrategy] - Strategy: "fallback" or "round-robin"
  * @param {number|string} [options.comboStickyLimit=1] - Requests per combo model before switching
+ * @param {boolean} [options.freeTierOnly=false] - When true, drop every non-free model id before
+ *   rotation. Keeps free-tier combos on $0.00 models — a paid candidate is refused (503)
+ *   rather than silently substituted.
  * @returns {Promise<Response>}
  */
-export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true }) {
+export async function handleComboChat({ body, models, handleSingleModel, log, comboName, comboStrategy, comboStickyLimit = 1, autoSwitch = true, freeTierOnly = false }) {
+  // Free-tier invariant: filter to free models BEFORE rotation so skipped models
+  // never consume sticky/rotation state and capacity-adapter additions (which may
+  // be paid, e.g. a vision model injected for an image request) are also caught.
+  if (freeTierOnly) {
+    const filtered = filterFreeTierModels(models);
+    if (filtered.length !== models.length) {
+      log.info("COMBO", `free-tier combo${comboName ? ` "${comboName}"` : ""}: filtering out ${models.length - filtered.length} non-free model(s): ${models.filter((m) => !isFreeModelId(m)).join(", ")}`);
+    }
+    if (filtered.length === 0) {
+      // Refuse rather than fall through to any paid model.
+      log.warn("COMBO", `free-tier combo${comboName ? ` "${comboName}"` : ""}: no free models available`);
+      return freeTierUnavailableResponse(comboName);
+    }
+    models = filtered;
+  }
+
   // Apply rotation strategy if enabled
   let rotatedModels = getRotatedModels(models, comboName, comboStrategy, comboStickyLimit);
 
@@ -299,6 +334,12 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
 
   for (let i = 0; i < rotatedModels.length; i++) {
     const modelStr = rotatedModels[i];
+    // Last firewall before the provider callback. Keep this invariant here so
+    // future capability adapters cannot accidentally reintroduce a paid model.
+    if (freeTierOnly && !isFreeModelId(modelStr)) {
+      log.error?.("COMBO", `free-tier combo${comboName ? ` "${comboName}"` : ""}: refusing non-free candidate ${modelStr}`);
+      continue;
+    }
     log.info("COMBO", `Trying model ${i + 1}/${rotatedModels.length}: ${modelStr}`);
 
     try {
@@ -365,6 +406,9 @@ export async function handleComboChat({ body, models, handleSingleModel, log, co
   // the request itself is invalid, but here the providers are simply unavailable
   // or have no active credentials. 503 is more accurate and retryable by clients.
   const allDisabled = lastError && lastError.toLowerCase().includes("no credentials");
+  if (freeTierOnly && !rotatedModels.some(isFreeModelId)) {
+    return freeTierUnavailableResponse(comboName);
+  }
   const status = allDisabled ? 503 : (lastStatus || 503);
   const msg = lastError || "All combo models unavailable";
 
@@ -542,11 +586,31 @@ function collectPanel(calls, { minPanel, stragglerGraceMs, panelHardTimeoutMs })
  * @param {string} [options.comboName] - Combo name (logging)
  * @param {string} [options.judgeModel] - Judge model; falls back to panel[0]
  * @param {Object} [options.tuning] - Override FUSION_DEFAULTS (minPanel, grace, timeout)
+ * @param {boolean} [options.freeTierOnly=false] - When true, drop every non-free panel model
+ *   and refuse a non-free judge (falls back to a free panel model). Keeps free-tier
+ *   fusion combos on $0.00 models; a paid panel that empties out is refused (503) rather than
+ *   silently substituted.
  * @returns {Promise<Response>}
  */
-export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning }) {
-  const panel = Array.isArray(models) ? models.filter(Boolean) : [];
+export async function handleFusionChat({ body, models, handleSingleModel, log, comboName, judgeModel, tuning, freeTierOnly = false }) {
+  let panel = Array.isArray(models) ? models.filter(Boolean) : [];
+
+  // Free-tier invariant: the panel is filtered BEFORE any fan-out so a paid
+  // model can never be called, and an explicitly configured paid judge is
+  // dropped in favour of a free panel member rather than being routed.
+  if (freeTierOnly) {
+    const filtered = filterFreeTierModels(panel);
+    if (filtered.length !== panel.length) {
+      log.info("COMBO", `free-tier fusion${comboName ? ` "${comboName}"` : ""}: filtering out ${panel.length - filtered.length} non-free panel model(s): ${panel.filter((m) => !isFreeModelId(m)).join(", ")}`);
+    }
+    panel = filtered;
+  }
+
   if (panel.length === 0) {
+    if (freeTierOnly) {
+      log.warn("COMBO", `free-tier fusion${comboName ? ` "${comboName}"` : ""}: no free models available`);
+      return freeTierUnavailableResponse(comboName);
+    }
     return new Response(
       JSON.stringify({ error: { message: "Fusion combo has no models" } }),
       { status: 400, headers: { "Content-Type": "application/json" } }
@@ -560,7 +624,11 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
 
   const cfg = { ...FUSION_DEFAULTS, ...(tuning || {}) };
   const minPanel = Math.min(Math.max(2, cfg.minPanel), panel.length);
-  const judge = judgeModel && judgeModel.trim() ? judgeModel.trim() : panel[0];
+  let judge = judgeModel && judgeModel.trim() ? judgeModel.trim() : panel[0];
+  if (freeTierOnly && !isFreeModelId(judge)) {
+    log.warn("COMBO", `free-tier fusion${comboName ? ` "${comboName}"` : ""}: judge "${judge}" is not free; falling back to panel model "${panel[0]}"`);
+    judge = panel[0];
+  }
   log.info("FUSION", `Combo "${comboName}" | panel=${panel.length} [${panel.join(", ")}] | judge=${judge} | quorum=${minPanel}`);
 
   // 1. Fan out to the panel in parallel: non-streaming, tools stripped (we want prose).
@@ -578,7 +646,13 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   }
 
   const t0 = Date.now();
-  const calls = panel.map((m) => withTimeout(handleSingleModel(panelBody, m, true), cfg.panelHardTimeoutMs));
+  const calls = panel.map((m) => {
+    if (freeTierOnly && !isFreeModelId(m)) {
+      log.error?.("FUSION", `free-tier fusion${comboName ? ` "${comboName}"` : ""}: refusing non-free panel ${m}`);
+      return Promise.resolve(null);
+    }
+    return withTimeout(handleSingleModel(panelBody, m, true), cfg.panelHardTimeoutMs);
+  });
   const settled = await collectPanel(calls, { ...cfg, minPanel });
   log.info("FUSION", `fan-out collected in ${Date.now() - t0}ms`);
 
@@ -621,5 +695,6 @@ export async function handleFusionChat({ body, models, handleSingleModel, log, c
   // 4. Judge analyzes + writes one final answer (streams to client if requested).
   const judgeBody = appendUserTurn(body, buildJudgePrompt(answers));
   log.info("FUSION", `Judging ${answers.length} answers with ${judge}`);
+  if (freeTierOnly && !isFreeModelId(judge)) return freeTierUnavailableResponse(comboName);
   return handleSingleModel(judgeBody, judge);
 }

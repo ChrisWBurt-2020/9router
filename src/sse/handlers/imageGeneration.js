@@ -5,8 +5,8 @@ import {
   extractApiKey,
   isValidApiKey,
 } from "../services/auth.js";
-import { getSettings } from "@/lib/localDb";
-import { getModelInfo, getComboModels } from "../services/model.js";
+import { getSettings, getComboByName } from "@/lib/localDb";
+import { getModelInfo } from "../services/model.js";
 import { handleImageGenerationCore } from "open-sse/handlers/imageGenerationCore.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
@@ -159,8 +159,10 @@ async function handleImageWithExecution(request, body, execution) {
   if (!body.prompt) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
 
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
-  const comboModels = await getComboModels(modelStr);
+  const comboRow = modelStr.includes("/") ? null : await getComboByName(modelStr);
+  const comboModels = comboRow?.models?.length ? comboRow.models : null;
   if (comboModels) {
+    const freeTierOnly = comboRow.kind === "free-tier";
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
@@ -169,6 +171,7 @@ async function handleImageWithExecution(request, body, execution) {
     return handleComboChat({
       body,
       models: comboModels,
+      freeTierOnly,
       handleSingleModel: (b, m, isPanel) => {
         // Fusion panels run in parallel and each really executes upstream:
         // fork a linked sub-execution so N executions don't collide on one id.

@@ -70,8 +70,10 @@ export async function handleSearch(request) {
 
   // Combo expansion: providerInput may be a combo name → run fallback/round-robin across providers
   const combos = await getCombos();
+  const comboRow = combos.find((c) => c.name === providerInput);
   const comboModels = getComboModelsFromData(providerInput, combos);
   if (comboModels) {
+    const freeTierOnly = comboRow?.kind === "free-tier";
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[providerInput]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
@@ -83,7 +85,8 @@ export async function handleSearch(request) {
       log,
       comboName: providerInput,
       comboStrategy,
-      comboStickyLimit
+      comboStickyLimit,
+      freeTierOnly,
     });
   }
 

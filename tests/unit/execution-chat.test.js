@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
   markAccountUnavailable: vi.fn(),
   clearAccountError: vi.fn(),
   getModelInfo: vi.fn(),
-  getComboModels: vi.fn(),
+  getComboByName: vi.fn(),
   checkAndRefreshToken: vi.fn(),
   updateProviderCredentials: vi.fn(),
   handleChatCore: vi.fn(),
@@ -24,10 +24,12 @@ vi.mock("@/sse/services/auth.js", () => ({
   isValidApiKey: mocks.isValidApiKey,
 }));
 
-vi.mock("@/lib/localDb", () => ({ getSettings: mocks.getSettings }));
+vi.mock("@/lib/localDb", () => ({
+  getSettings: mocks.getSettings,
+  getComboByName: mocks.getComboByName,
+}));
 vi.mock("@/sse/services/model.js", () => ({
   getModelInfo: mocks.getModelInfo,
-  getComboModels: mocks.getComboModels,
 }));
 vi.mock("@/sse/services/tokenRefresh.js", () => ({
   updateProviderCredentials: mocks.updateProviderCredentials,
@@ -166,7 +168,10 @@ describe("execution receipts through the chat handler", () => {
   });
 
   it("account fallback preserves ordered attempts; combo name preserved", async () => {
-    mocks.getComboModels.mockResolvedValue(["openai/gpt-4o", "openrouter/meta-llama/llama-3.3-70b"]);
+    mocks.getComboByName.mockResolvedValue({
+      models: ["openai/gpt-4o", "openrouter/meta-llama/llama-3.3-70b"],
+      kind: null,
+    });
     mocks.getProviderCredentials.mockResolvedValue({
       connectionId: "conn-1",
       connectionName: "Primary",
@@ -204,6 +209,44 @@ describe("execution receipts through the chat handler", () => {
     expect(receipt.attempts[1].status).toBe("success");
     expect(receipt.actual.model).toBe("meta-llama/llama-3.3-70b");
     expect(receipt.request.model).toBe("combo-a");
+  });
+
+  it("single-model combo path reuses getModelInfo's combo row (one lookup) and enforces freeTierOnly", async () => {
+    // Top-level combo resolution misses, so the request falls through to
+    // handleSingleModelChat, whose getModelInfo resolves the combo row instead.
+    mocks.getComboByName.mockResolvedValue(undefined);
+    mocks.getModelInfo.mockImplementation(async (m) => {
+      if (m === "gov-build") {
+        return {
+          provider: null,
+          model: "gov-build",
+          combo: { kind: "free-tier", models: ["openai/gpt-4o", "openrouter/qwen/qwen3.6-plus:free"] },
+        };
+      }
+      const s = String(m);
+      if (s.includes("/")) {
+        const slash = s.indexOf("/");
+        return { provider: s.slice(0, slash), model: s.slice(slash + 1) };
+      }
+      return { provider: "openai", model: s };
+    });
+    mocks.getProviderCredentials.mockResolvedValue({
+      connectionId: "conn-1",
+      connectionName: "Primary",
+      authType: "apikey",
+    });
+
+    const res = await handleChat(
+      chatRequest({ model: "gov-build", messages: [{ role: "user", content: "hi" }] })
+    );
+
+    expect(res.status).toBe(200);
+    // Fix: the row came back from getModelInfo — no second getComboByName.
+    expect(mocks.getComboByName).toHaveBeenCalledTimes(1);
+    // Fix: the paid panel member was filtered before any upstream call.
+    const attempted = mocks.handleChatCore.mock.calls.map((c) => c[0].modelInfo.model);
+    expect(attempted).toEqual(["qwen/qwen3.6-plus:free"]);
+    expect(attempted).not.toContain("gpt-4o");
   });
 
   it("fusion panels fork linked sub-executions with distinct ids (no id collision)", async () => {

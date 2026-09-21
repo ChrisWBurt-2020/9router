@@ -133,6 +133,13 @@ async function ensureRingInitialized() {
 
 async function calculateCost(provider, model, tokens) {
   if (!tokens || !provider || !model) return { amount: 0, state: "unknown" };
+  try {
+    // Free-tier model ids are zero-cost by construction (`:free` suffix or the
+    // `openrouter/free` catch-all). Report that as an authoritative zero rather
+    // than "unknown", which would read as unproven spend on receipts.
+    const { isFreeModelId } = await import("open-sse/config/freeModels.js");
+    if (isFreeModelId(model)) return { amount: 0, state: "zero" };
+  } catch {}
   const hasUsageBasis = ["prompt_tokens", "completion_tokens", "input_tokens", "output_tokens", "cached_tokens"]
     .some((k) => Number(tokens[k]) > 0);
   if (!hasUsageBasis) return { amount: 0, state: "unknown" };

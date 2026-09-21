@@ -70,9 +70,9 @@ export async function getModelInfo(modelStr) {
   // This prevents combo names from being incorrectly routed to providers
   const combo = await getComboByName(parsed.model);
   if (combo) {
-    // Return null provider to signal this should be handled as combo
-    // The caller (handleChat) will detect this and handle it as combo
-    return { provider: null, model: parsed.model };
+    // Return null provider to signal this should be handled as combo.
+    // Carry the row we already fetched so callers never need a second lookup.
+    return { provider: null, model: parsed.model, combo };
   }
 
   return getModelInfoCore(modelStr, getModelAliases);
