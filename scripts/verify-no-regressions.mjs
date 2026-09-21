@@ -24,7 +24,10 @@ function failures(file) {
   const result = JSON.parse(fs.readFileSync(file, "utf8"));
   const out = new Set();
   for (const suite of result.testResults || []) for (const assertion of suite.assertionResults || []) {
-    if (assertion.status === "failed") out.add(`${suite.name} :: ${assertion.fullName}`);
+    if (assertion.status === "failed") {
+      const suiteName = String(suite.name).replace(/^.*[\\/]tests[\\/]/, "tests/");
+      out.add(`${suiteName} :: ${assertion.fullName}`);
+    }
   }
   return out;
 }
