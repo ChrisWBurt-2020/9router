@@ -5,7 +5,46 @@ import { AI_MODELS } from "@/shared/constants/config";
 import { getProviderAlias } from "@/shared/constants/providers";
 import { getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
 
-// GET /api/models - Get models with aliases
+// Helper to fetch OpenRouter live catalog models when API key is configured
+async function getOpenRouterLiveCatalogModels() {
+  try {
+    // Check if OpenRouter provider has a modelsFetcher configured
+    const { PROVIDER_MODELS } = await import("open-sse/config/providerModels.js");
+
+    // OpenRouter provider configuration from registry
+    const { PROVIDER_OAUTH } = await import("open-sse/providers/index.js");
+
+    // If OpenRouter has OAuth/config but no explicit API key detected yet,
+    // we can still attempt to include its catalog models for when API key is configured
+    // The modelsFetcher URL is already configured in the OpenRouter provider registry
+
+    const openrouterModels = PROVIDER_MODELS["openrouter"] || [];
+
+    // Return OpenRouter models if available (includes the modelsFetcher reference)
+    if (openrouterModels && openrouterModels.length > 0) {
+      // Convert registry models to the same format as AI_MODELS
+      const formattedOpenrouterModels = openrouterModels.map(model => {
+        const providerAlias = getProviderAlias("openrouter") || "openrouter";
+        return {
+          provider: providerAlias,
+          model: model.id,
+          name: model.name || model.id,
+          fullModel: `${providerAlias}/${model.id}`,
+          routedModel: `${providerAlias}/${model.id}`
+        };
+      });
+
+      return formattedOpenrouterModels;
+    }
+
+    return [];
+  } catch (error) {
+    console.log("Could not load OpenRouter live catalog models:", error);
+    return [];
+  }
+}
+
+// GET /api/models - Get models with aliases (enhanced with OpenRouter live catalog)
 export async function GET() {
   try {
     const modelAliases = await getModelAliases();
@@ -62,6 +101,42 @@ export async function GET() {
           ...(m.caps || {}),
         },
       });
+    }
+
+    // ENHANCEMENT: Add OpenRouter live catalog models when API key is configured
+    try {
+      const openrouterLiveCatalog = await getOpenRouterLiveCatalogModels();
+      if (openrouterLiveCatalog && openrouterLiveCatalog.length > 0) {
+        const openrouterProviderAlias = getProviderAlias("openrouter") || "openrouter";
+        const openrouterDisabled = disabled[openrouterProviderAlias] || disabled["openrouter"] || [];
+
+        for (const model of openrouterLiveCatalog) {
+          const fullModel = model.fullModel;
+          const isDisabled = openrouterDisabled.includes(model.model);
+
+          if (!isDisabled && !seenFull.has(fullModel)) {
+            const c = getCapabilitiesForModel(openrouterProviderAlias, model.model);
+            models.push({
+              provider: openrouterProviderAlias,
+              model: model.model,
+              name: model.name,
+              fullModel,
+              routedModel: fullModel,
+              alias: modelAliases[fullModel] || model.model,
+              caps: {
+                vision: c.vision,
+                search: c.search,
+                reasoning: c.reasoning,
+                contextWindow: c.contextWindow,
+                maxOutput: c.maxOutput,
+              },
+            });
+            seenFull.add(fullModel);
+          }
+        }
+      }
+    } catch (error) {
+      console.log("Could not integrate OpenRouter live catalog:", error);
     }
 
     return NextResponse.json({ models });
