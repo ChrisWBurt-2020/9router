@@ -1,4 +1,5 @@
 import { buildExecutionReceipt, buildUsageMeta, recordLatency, recordUsage, recordCost, finalizeExecutionState } from "open-sse/services/executionReceipt.js";
+import { reportSpendToGovernor, spendReportFromExecution } from "../spendGate.js";
 import {
   saveRequestDetail, getRequestDetailById, flushRequestDetails,
   getUsageRecordByExecutionId, getUsageRecordsByTraceId, getRecentExecutions,
@@ -112,6 +113,16 @@ export async function recordExecutionUsage(execution, {
       }
       if (tokens && Object.keys(tokens).length) recordUsage(execution, tokens);
     }
+    // Spend gate: feed actuals to governor's ledger hook so it can track
+    // effective cost per consumer/model/provider. Best-effort and never
+    // throwing; no-op unless GOVERNOR_BASE_URL is set.
+    try {
+      reportSpendToGovernor(spendReportFromExecution(execution, {
+        status,
+        tokens,
+        costUsd: res && res.cost != null ? res.cost : null,
+      }));
+    } catch { /* the ledger hook must never break usage persistence */ }
     return res;
   } catch {
     if (execution) {

@@ -20,6 +20,7 @@ import {
   newExecutionId,
 } from "open-sse/services/executionReceipt.js";
 import { finalizeExecution, recordExecutionUsage } from "@/lib/execution/receiptStore.js";
+import { checkSpendGate, budgetExhaustedResponse, pricePolicyFor, withMaxPrice, selectOutboundCredentials } from "@/lib/spendGate.js";
 
 // Providers that don't require credentials (noAuth)
 const NO_AUTH_PROVIDERS = new Set(["sdwebui", "comfyui"]);
@@ -158,11 +159,21 @@ async function handleImageWithExecution(request, body, execution) {
   if (!modelStr) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   if (!body.prompt) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: prompt");
 
+  // Spend gate: per-request quota check before any provider is contacted.
+  // A deny is terminal (no retry, no fallback).
+  const spendGate = checkSpendGate({ heron: execution?.heron });
+  if (execution) execution.spendGate = spendGate;
+  if (spendGate.decision === "deny") {
+    log.warn("SPEND", `Budget deny for consumer "${spendGate.consumer}": ${spendGate.reason}`);
+    return budgetExhaustedResponse(spendGate);
+  }
+
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
   const comboRow = modelStr.includes("/") ? null : await getComboByName(modelStr);
   const comboModels = comboRow?.models?.length ? comboRow.models : null;
   if (comboModels) {
     const freeTierOnly = comboRow.kind === "free-tier";
+    if (execution?.spendGate) execution.spendGate.comboFreeTier = freeTierOnly;
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
@@ -213,6 +224,14 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
   if (!modelInfo.provider) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Invalid model format");
 
   const { provider, model } = modelInfo;
+  // Spend gate: price tag for OpenRouter-bound image requests. Unmanaged
+  // consumers (no governor quota entry) keep existing behavior.
+  const isg = execution?.spendGate;
+  if (isg && isg.decision === "allow" && provider === "openrouter") {
+    const policy = pricePolicyFor(isg, { model: modelStr, freeTierOnly: isg.comboFreeTier === true });
+    isg.tier = policy.tier;
+    if (policy.maxPrice) body = withMaxPrice(body, policy.maxPrice);
+  }
   if (execution) {
     setRouting(execution, { reason: execution.routingReason || "direct" });
     if (!execution.requestedCombo && !String(modelStr).includes("/") && modelStr !== model) {
@@ -268,6 +287,15 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
 
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
 
+    // Per-consumer key selection: voice traffic uses the dedicated capped
+    // OpenRouter key when set. Copy-on-write: the stored connection object
+    // (receipts, credential persistence) is never mutated.
+    const outboundCredentials = selectOutboundCredentials(refreshedCredentials, {
+      provider,
+      heron: execution?.heron,
+      onWarn: (m) => log.warn("SPEND", m),
+    });
+
     const attempt = beginAttempt(execution, {
       candidate: modelStr,
       provider,
@@ -279,7 +307,7 @@ async function handleSingleModelImage(body, modelStr, { wantsStream, binaryOutpu
     const result = await handleImageGenerationCore({
       body,
       modelInfo: { provider, model },
-      credentials: refreshedCredentials,
+      credentials: outboundCredentials,
       streamToClient: wantsStream,
       binaryOutput,
       execution,

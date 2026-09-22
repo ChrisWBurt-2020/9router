@@ -13,6 +13,8 @@ import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
+import { extractHeronCorrelation } from "open-sse/services/executionReceipt.js";
+import { checkSpendGate, budgetExhaustedResponse } from "@/lib/spendGate.js";
 
 /**
  * Handle web search request for the SSE/Next.js server.
@@ -56,6 +58,18 @@ export async function handleSearch(request) {
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
+  }
+
+  // Spend gate: per-request quota check before any provider is contacted.
+  // A deny is terminal (no retry, no fallback).
+  const searchHeron = extractHeronCorrelation({
+    headers: Object.fromEntries(request.headers.entries()),
+    body,
+  });
+  const searchGate = checkSpendGate({ heron: searchHeron.present ? searchHeron.values : null });
+  if (searchGate.decision === "deny") {
+    log.warn("SPEND", `Budget deny for consumer "${searchGate.consumer}": ${searchGate.reason}`);
+    return budgetExhaustedResponse(searchGate);
   }
 
   if (!providerInput || typeof providerInput !== "string") {

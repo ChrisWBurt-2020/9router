@@ -14,6 +14,8 @@ import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { handleComboChat, getComboModelsFromData } from "open-sse/services/combo.js";
 import { assertPublicUrlResolved } from "@/shared/utils/ssrfGuard.js";
+import { extractHeronCorrelation } from "open-sse/services/executionReceipt.js";
+import { checkSpendGate, budgetExhaustedResponse } from "@/lib/spendGate.js";
 
 /**
  * Handle web fetch (URL extraction) request for the SSE/Next.js server.
@@ -59,6 +61,18 @@ export async function handleFetch(request) {
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
     }
+  }
+
+  // Spend gate: per-request quota check before any provider is contacted.
+  // A deny is terminal (no retry, no fallback).
+  const fetchHeron = extractHeronCorrelation({
+    headers: Object.fromEntries(request.headers.entries()),
+    body,
+  });
+  const fetchGate = checkSpendGate({ heron: fetchHeron.present ? fetchHeron.values : null });
+  if (fetchGate.decision === "deny") {
+    log.warn("SPEND", `Budget deny for consumer "${fetchGate.consumer}": ${fetchGate.reason}`);
+    return budgetExhaustedResponse(fetchGate);
   }
 
   if (!providerInput || typeof providerInput !== "string") {

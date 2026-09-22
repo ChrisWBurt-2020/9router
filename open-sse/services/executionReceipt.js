@@ -22,6 +22,10 @@ export const HERON_HEADERS = {
   intent_id: "x-heron-intent-id",
   work_id: "x-heron-work-id",
   world_id: "x-heron-world-id",
+  // Spend-gate consumer identity (e.g. "homenode-voice"). Correlation metadata
+  // only -- never grants privileges. Used by the 9router spend gate to select
+  // the governor quota entry for this request.
+  consumer: "x-heron-consumer",
 };
 
 // Accepted OpenAI `metadata` keys. The dashboard/Heron may use either the
@@ -32,6 +36,7 @@ export const HERON_METADATA_KEYS = {
   intent_id: ["heron_intent_id", "heronIntentId"],
   work_id: ["heron_work_id", "heronWorkId"],
   world_id: ["heron_world_id", "heronWorldId"],
+  consumer: ["heron_consumer", "heronConsumer"],
 };
 export const RECEIPT_PERSISTENCE_HEADER = "X-9Router-Receipt-Persistence";
 

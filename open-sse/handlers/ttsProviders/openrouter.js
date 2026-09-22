@@ -4,7 +4,7 @@ import { PROVIDER_MEDIA } from "../../providers/index.js";
 const TTS_CFG = PROVIDER_MEDIA["openrouter"]?.ttsConfig || {};
 
 export default {
-  async synthesize(text, model, credentials) {
+  async synthesize(text, model, credentials, responseFormat, opts) {
     if (!credentials?.apiKey) throw new Error("No OpenRouter API key configured");
 
     // model format: "tts-model/voice" e.g. "openai/gpt-4o-mini-tts/alloy"
@@ -37,6 +37,9 @@ export default {
         audio: { voice, format: "wav" },
         stream: true,
         messages: [{ role: "user", content: text }],
+        // Spend gate: enforce the price tag at routing time. Only understood
+        // by OpenRouter; omitted for unmanaged consumers (no policy).
+        ...(opts?.maxPrice ? { provider: { max_price: { prompt: opts.maxPrice.prompt, completion: opts.maxPrice.completion } } } : {}),
       }),
     });
 

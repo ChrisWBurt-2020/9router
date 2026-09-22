@@ -16,6 +16,7 @@ import {
   sanitizeConnectionIdentity, attachExecutionHeaders, finalizeExecutionState,
 } from "open-sse/services/executionReceipt.js";
 import { finalizeExecution, recordExecutionUsage } from "@/lib/execution/receiptStore.js";
+import { checkSpendGate, budgetExhaustedResponse, pricePolicyFor, selectOutboundCredentials } from "@/lib/spendGate.js";
 
 // Derived from providers.js: any TTS provider not noAuth requires stored credentials
 const CREDENTIALED_PROVIDERS = new Set(
@@ -113,11 +114,21 @@ async function handleTtsWithExecution(request, body, execution) {
   if (!modelStr) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   if (!body.input) return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing required field: input");
 
+  // Spend gate: per-request quota check before any provider is contacted.
+  // A deny is terminal (no retry, no fallback).
+  const spendGate = checkSpendGate({ heron: execution?.heron });
+  if (execution) execution.spendGate = spendGate;
+  if (spendGate.decision === "deny") {
+    log.warn("SPEND", `Budget deny for consumer "${spendGate.consumer}": ${spendGate.reason}`);
+    return budgetExhaustedResponse(spendGate);
+  }
+
   // Combo expansion: model may be a combo name → run fallback/round-robin across models
   const comboRow = modelStr.includes("/") ? null : await getComboByName(modelStr);
   const comboModels = comboRow?.models?.length ? comboRow.models : null;
   if (comboModels) {
     const freeTierOnly = comboRow.kind === "free-tier";
+    if (execution?.spendGate) execution.spendGate.comboFreeTier = freeTierOnly;
     const comboStrategies = settings.comboStrategies || {};
     const comboStrategy = comboStrategies[modelStr]?.fallbackStrategy || settings.comboStrategy || "fallback";
     const comboStickyLimit = settings.comboStickyRoundRobinLimit;
@@ -149,12 +160,21 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, st
       execution.requestedAlias = modelStr;
     }
   }
+  // Spend gate: price tag for OpenRouter-bound TTS. Unmanaged consumers
+  // (no governor quota entry) keep existing behavior.
+  let ttsMaxPrice = null;
+  const tsg = execution?.spendGate;
+  if (tsg && tsg.decision === "allow" && provider === "openrouter") {
+    const policy = pricePolicyFor(tsg, { model: modelStr, freeTierOnly: tsg.comboFreeTier === true });
+    tsg.tier = policy.tier;
+    ttsMaxPrice = policy.maxPrice;
+  }
   log.info("ROUTING", `Provider: ${provider}, Voice: ${model}`);
 
   // noAuth providers — no credential needed
   if (!CREDENTIALED_PROVIDERS.has(provider)) {
     const attempt = beginAttempt(execution, { candidate: modelStr, provider, model, reason: "primary" });
-    const result = await handleTtsCore({ provider, model, input: body.input, responseFormat, language, style });
+    const result = await handleTtsCore({ provider, model, input: body.input, responseFormat, language, style, maxPrice: ttsMaxPrice });
     endAttempt(execution, attempt, { success: result.success, status: result.status, error: result.error });
     if (result.success) {
       await recordExecutionUsage(execution, {
@@ -201,7 +221,15 @@ async function handleSingleModelTts(body, modelStr, responseFormat, language, st
       reason: excludeConnectionIds.size > 0 ? "account_fallback" : "primary",
     });
 
-    const result = await handleTtsCore({ provider, model, input: body.input, credentials, responseFormat, language, style });
+    // Per-consumer key selection: voice traffic uses the dedicated capped
+    // OpenRouter key when set. Copy-on-write: the stored connection object
+    // (receipts, credential persistence) is never mutated.
+    const outboundCredentials = selectOutboundCredentials(credentials, {
+      provider,
+      heron: execution?.heron,
+      onWarn: (m) => log.warn("SPEND", m),
+    });
+    const result = await handleTtsCore({ provider, model, input: body.input, credentials: outboundCredentials, responseFormat, language, style, maxPrice: ttsMaxPrice });
     endAttempt(execution, attempt, { success: result.success, status: result.status, error: result.error });
 
     if (result.success) {

@@ -31,6 +31,7 @@ import {
   newExecutionId,
 } from "open-sse/services/executionReceipt.js";
 import { finalizeExecution, recordExecutionUsage } from "@/lib/execution/receiptStore.js";
+import { checkSpendGate, budgetExhaustedResponse, pricePolicyFor, withMaxPrice, selectOutboundCredentials } from "@/lib/spendGate.js";
 
 function executionCapability(pathname) {
   if (pathname.includes("/responses")) return "responses";
@@ -249,6 +250,15 @@ async function handleChatWithExecution(request, body, clientRawRequest, executio
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   }
 
+  // Spend gate: per-request quota check. Runs before any provider is contacted
+  // and before any fallback logic; a deny is terminal (no retry, no fallback).
+  const spendGate = checkSpendGate({ heron: execution?.heron });
+  if (execution) execution.spendGate = spendGate;
+  if (spendGate.decision === "deny") {
+    log.warn("SPEND", `Budget deny for consumer "${spendGate.consumer}": ${spendGate.reason}`);
+    return budgetExhaustedResponse(spendGate);
+  }
+
   // Bypass naming/warmup requests before combo rotation to avoid wasting rotation slots
   const userAgent = request?.headers?.get("user-agent") || "";
   const bypassResponse = handleBypassRequest(body, modelStr, userAgent, !!settings.ccFilterNaming);
@@ -261,6 +271,7 @@ async function handleChatWithExecution(request, body, clientRawRequest, executio
   const comboModels = comboRow?.models?.length ? comboRow.models : null;
   if (comboModels) {
     const freeTierOnly = comboRow?.kind === "free-tier";
+    if (execution?.spendGate) execution.spendGate.comboFreeTier = freeTierOnly;
     // Check for combo-specific strategy first, fallback to global
     const comboStrategies = settings.comboStrategies || {};
     const comboSpecificStrategy = comboStrategies[modelStr]?.fallbackStrategy;
@@ -358,6 +369,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     const comboModels = comboRow?.models?.length ? comboRow.models : null;
     if (comboModels) {
       const freeTierOnly = comboRow?.kind === "free-tier";
+    if (execution?.spendGate) execution.spendGate.comboFreeTier = freeTierOnly;
       const chatSettings = await getSettings();
       // Check for combo-specific strategy first, fallback to global
       const comboStrategies = chatSettings.comboStrategies || {};
@@ -425,6 +437,15 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   }
 
   const { provider, model } = modelInfo;
+  // Spend gate: enforce the price tag on OpenRouter-bound requests. Tier comes
+  // from the combo's free-tier policy (stashed above) or the model id itself.
+  // Unmanaged consumers (no governor quota entry) keep existing behavior.
+  const sg = execution?.spendGate;
+  if (sg && sg.decision === "allow" && provider === "openrouter") {
+    const { tier, maxPrice } = pricePolicyFor(sg, { model: modelStr, freeTierOnly: sg.comboFreeTier === true });
+    sg.tier = tier;
+    if (maxPrice) body = withMaxPrice(body, maxPrice);
+  }
   if (execution) {
     setRouting(execution, { reason: execution.routingReason || "direct" });
     // A bare model string that resolved to provider/model is an alias.
@@ -473,6 +494,15 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     // Account selection shown in the unified "▶" line (acc:...)
     const refreshedCredentials = await checkAndRefreshToken(provider, credentials);
 
+    // Per-consumer key selection: voice traffic uses the dedicated capped
+    // OpenRouter key when set. Copy-on-write: the stored connection object
+    // (receipts, credential persistence) is never mutated.
+    const outboundCredentials = selectOutboundCredentials(refreshedCredentials, {
+      provider,
+      heron: execution?.heron,
+      onWarn: (m) => log.warn("SPEND", m),
+    });
+
     // Ensure real project ID is available for providers that need it (P0 fix: cold miss)
     if ((provider === "antigravity" || provider === "gemini-cli") && !refreshedCredentials.projectId) {
       const pid = await getProjectIdForConnection(credentials.connectionId, refreshedCredentials.accessToken, provider);
@@ -498,7 +528,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
     const result = await handleChatCore({
       body: { ...body, model: `${provider}/${model}` },
       modelInfo: { provider, model },
-      credentials: refreshedCredentials,
+      credentials: outboundCredentials,
       log,
       clientRawRequest,
       connectionId: credentials.connectionId,
