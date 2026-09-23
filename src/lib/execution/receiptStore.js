@@ -117,7 +117,7 @@ export async function recordExecutionUsage(execution, {
     // effective cost per consumer/model/provider. Best-effort and never
     // throwing; no-op unless GOVERNOR_BASE_URL is set.
     try {
-      reportSpendToGovernor(spendReportFromExecution(execution, {
+      void reportSpendToGovernor(spendReportFromExecution(execution, {
         status,
         tokens,
         costUsd: res && res.cost != null ? res.cost : null,

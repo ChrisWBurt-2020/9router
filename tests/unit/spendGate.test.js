@@ -15,6 +15,7 @@ import {
   budgetExhaustedResponse,
   isBudgetExhaustedResponse,
   spendReportFromExecution,
+  reportSpendToGovernor,
   selectOutboundCredentials,
   resetVoiceKeyWarning,
   VOICE_CONSUMER,
@@ -43,8 +44,8 @@ describe("resolveConsumer", () => {
   it("prefers the explicit x-heron-consumer value", () => {
     expect(resolveConsumer({ consumer: "homenode-voice", work_id: "w1" })).toBe("homenode-voice");
   });
-  it("falls back to work_id", () => {
-    expect(resolveConsumer({ work_id: "work-42" })).toBe("work-42");
+  it("does not treat a work id as a billing identity", () => {
+    expect(resolveConsumer({ work_id: "work-42" })).toBeNull();
   });
   it("falls back to \"default\" with no correlation", () => {
     expect(resolveConsumer(null)).toBe("default");
@@ -93,13 +94,13 @@ describe("checkSpendGate", () => {
     expect(d.message).toContain("homenode-voice");
   });
 
-  it("allows an unlisted consumer (governor claims jurisdiction by listing)", () => {
+  it("denies a Heron-controlled request for an unregistered consumer", () => {
     writeQuota({
       "homenode-voice": { daily_cap_usd: 1.0, spent_today_usd: 0.0 },
     });
     const d = checkSpendGate({ heron: { consumer: "opencode" } });
-    expect(d.decision).toBe("allow");
-    expect(d.unmanaged).toBe(true);
+    expect(d.decision).toBe("deny");
+    expect(d.reason).toBe("consumer_unregistered");
   });
 });
 
@@ -167,9 +168,9 @@ describe("price policy", () => {
     expect(maxPriceForTier(gate, "paid")).toEqual(DEFAULT_PAID_MAX_PRICE);
   });
 
-  it("unmanaged consumers get no max_price (existing behavior preserved)", () => {
+  it("unmanaged traffic without Heron identity keeps existing behavior", () => {
     writeQuota({ "homenode-voice": entry });
-    const gate = checkSpendGate({ heron: { consumer: "opencode" } });
+    const gate = checkSpendGate({ heron: null });
     expect(gate.unmanaged).toBe(true);
     expect(maxPriceForTier(gate, "paid")).toBeNull();
     expect(pricePolicyFor(gate, { model: "openrouter/deepseek/deepseek-v4-flash" }).maxPrice).toBeNull();
@@ -218,6 +219,31 @@ describe("spendReportFromExecution", () => {
     expect(payload.tier).toBe("paid");
     expect(payload.trace_id).toBe("t1");
     expect(JSON.stringify(payload)).not.toContain("sk-or-");
+  });
+});
+
+describe("reportSpendToGovernor", () => {
+  const OLD_BASE = process.env.GOVERNOR_BASE_URL;
+  const OLD_FETCH = global.fetch;
+  afterEach(() => {
+    if (OLD_BASE === undefined) delete process.env.GOVERNOR_BASE_URL;
+    else process.env.GOVERNOR_BASE_URL = OLD_BASE;
+    global.fetch = OLD_FETCH;
+  });
+
+  it("marks missing cost or usage unverified without sending a record", async () => {
+    process.env.GOVERNOR_BASE_URL = "http://127.0.0.1:9";
+    global.fetch = vi.fn();
+    const result = await reportSpendToGovernor({ execution_id: "e1", request_id: "e1", input_tokens: 10, output_tokens: 2, cost_usd: null });
+    expect(result.status).toBe("unverified");
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("surfaces rejected spend reports to the caller", async () => {
+    process.env.GOVERNOR_BASE_URL = "http://127.0.0.1:9";
+    global.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: "consumer_unknown" }), { status: 422 }));
+    const result = await reportSpendToGovernor({ execution_id: "e2", request_id: "e2", input_tokens: 10, output_tokens: 2, cost_usd: 0.01 });
+    expect(result).toMatchObject({ status: "rejected", httpStatus: 422, code: "consumer_unknown" });
   });
 });
 

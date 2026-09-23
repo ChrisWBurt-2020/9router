@@ -65,17 +65,26 @@ export function readQuotaState() {
 }
 
 /**
- * Resolve the spend consumer from Heron correlation values. Accepts either the
- * flat values object (execution.heron) or the raw {values} wrapper.
- * Order: explicit x-heron-consumer -> work_id -> "default".
+ * Resolve an explicit consumer claim from Heron correlation values. Work IDs
+ * are provenance, not billing identities. The claim must name a registered
+ * consumer for Heron-controlled traffic; generic unmanaged traffic keeps the
+ * legacy "default" bucket.
  */
 export function resolveConsumer(heron) {
   const v = (heron && (heron.values || heron)) || {};
   const explicit = v.consumer;
   if (typeof explicit === "string" && explicit.trim()) return explicit.trim().slice(0, 128);
-  const work = v.work_id;
-  if (typeof work === "string" && work.trim()) return work.trim().slice(0, 128);
-  return "default";
+  const controlled = ["trace_id", "intent_id", "work_id", "world_id"].some((key) =>
+    typeof v[key] === "string" && v[key].trim()
+  );
+  return controlled ? null : "default";
+}
+
+function hasHeronCorrelation(heron) {
+  const v = (heron && (heron.values || heron)) || {};
+  return ["trace_id", "intent_id", "work_id", "world_id", "consumer"].some((key) =>
+    typeof v[key] === "string" && v[key].trim()
+  );
 }
 
 function deny(consumer, reason, message) {
@@ -109,6 +118,10 @@ function allow(consumer, { unmanaged = false, entry = null } = {}) {
  */
 export function checkSpendGate({ heron = null } = {}) {
   const consumer = resolveConsumer(heron);
+  const heronControlled = hasHeronCorrelation(heron);
+  if (heronControlled && !consumer) {
+    return deny("unknown", "consumer_identity_required", "Heron-controlled request has no explicit consumer identity; refusing before provider routing.");
+  }
   const read = readQuotaState();
   if (!read.ok) {
     return deny(
@@ -119,6 +132,9 @@ export function checkSpendGate({ heron = null } = {}) {
   }
   const entry = read.state.consumers[consumer];
   if (!entry || typeof entry !== "object") {
+    if (heronControlled) {
+      return deny(consumer, "consumer_unregistered", `Heron-controlled consumer "${consumer}" has no registered quota; refusing before provider routing.`);
+    }
     // Governor claims jurisdiction by listing a consumer. Unlisted consumers
     // keep existing behavior (no max_price injection, no cap).
     return allow(consumer, { unmanaged: true });
@@ -235,16 +251,29 @@ function governorBaseUrl() {
 export function spendReportFromExecution(execution, { status = null, tokens = null, costUsd = null } = {}) {
   const heron = execution?.heron || {};
   const gate = execution?.spendGate || null;
+  const tokenCount = (...values) => {
+    for (const value of values) {
+      const n = Number(value);
+      if (Number.isSafeInteger(n) && n >= 0) return n;
+    }
+    return null;
+  };
+  const inputTokens = tokenCount(tokens?.input_tokens, tokens?.prompt_tokens, tokens?.prompt, tokens?.input);
+  const outputTokens = tokenCount(tokens?.output_tokens, tokens?.completion_tokens, tokens?.completion, tokens?.output);
+  const executionId = execution?.executionId || null;
   return {
     schema: "heron.spend_report/v1",
     recorded_at: new Date().toISOString(),
     consumer: gate?.consumer || resolveConsumer(heron),
-    execution_id: execution?.executionId || null,
+    request_id: executionId,
+    execution_id: executionId,
     trace_id: heron.trace_id || null,
     endpoint: execution?.endpoint || null,
     provider: execution?.actual?.provider || null,
     model: execution?.actual?.model || execution?.requestedModel || null,
     status,
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
     tokens: tokens && typeof tokens === "object" ? tokens : {},
     cost_usd: Number.isFinite(Number(costUsd)) ? Number(costUsd) : null,
     tier: gate?.tier || null,
@@ -257,23 +286,36 @@ export function spendReportFromExecution(execution, { status = null, tokens = nu
  * and never blocks: a down/missing governor must not fail a request.
  * No-op unless GOVERNOR_BASE_URL is set.
  */
-export function reportSpendToGovernor(payload) {
+export async function reportSpendToGovernor(payload) {
   const base = governorBaseUrl();
-  if (!base || !payload) return;
+  if (!base || !payload) return { status: "not_configured" };
+  if (!payload.request_id || payload.input_tokens == null || payload.output_tokens == null || payload.cost_usd == null) {
+    console.warn?.(`[9router] governor spend report unverified for ${payload.execution_id || "unknown execution"}: usage or cost missing`);
+    return { status: "unverified" };
+  }
+  let timer;
   try {
     const url = `${base.replace(/\/+$/, "")}/spend`;
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 2000);
-    fetch(url, {
+    timer = setTimeout(() => ctrl.abort(), 2000);
+    const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       signal: ctrl.signal,
-    })
-      .catch(() => {})
-      .finally(() => clearTimeout(timer));
-  } catch {
-    // never fail the request because the ledger hook is unhappy
+    });
+    if (!response.ok) {
+      let code = "unknown";
+      try { code = (await response.json())?.error || code; } catch { /* omit unparseable body */ }
+      console.warn?.(`[9router] governor rejected spend report for ${payload.execution_id}: HTTP ${response.status} (${String(code).slice(0, 80)})`);
+      return { status: "rejected", httpStatus: response.status, code };
+    }
+    return { status: "accepted" };
+  } catch (error) {
+    console.warn?.(`[9router] governor spend report failed for ${payload.execution_id}: ${error?.name || "transport error"}`);
+    return { status: "failed" };
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

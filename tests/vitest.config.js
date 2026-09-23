@@ -19,7 +19,7 @@ export default defineConfig({
     silent: false,
     // Spend gate is fail-closed without a governor quota file; give the suite
     // a permissive fixture so handler tests exercise normal routing.
-    setupFiles: ["./test-setup/spend-gate-fixture.js"],
+    setupFiles: ["./tests/test-setup/spend-gate-fixture.js"],
   },
   resolve: {
     // Use array form so subpath aliases (e.g. "@/lib/db/index.js") resolve correctly.
