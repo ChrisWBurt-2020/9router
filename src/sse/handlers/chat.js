@@ -31,7 +31,7 @@ import {
   newExecutionId,
 } from "open-sse/services/executionReceipt.js";
 import { finalizeExecution, recordExecutionUsage } from "@/lib/execution/receiptStore.js";
-import { checkSpendGate, budgetExhaustedResponse, pricePolicyFor, withMaxPrice, selectOutboundCredentials } from "@/lib/spendGate.js";
+import { checkSpendGate, budgetExhaustedResponse, pricePolicyFor, withMaxPrice, selectOutboundCredentials, CONSUMER_ATTESTATION_HEADER } from "@/lib/spendGate.js";
 
 function executionCapability(pathname) {
   if (pathname.includes("/responses")) return "responses";
@@ -252,7 +252,11 @@ async function handleChatWithExecution(request, body, clientRawRequest, executio
 
   // Spend gate: per-request quota check. Runs before any provider is contacted
   // and before any fallback logic; a deny is terminal (no retry, no fallback).
-  const spendGate = checkSpendGate({ heron: execution?.heron });
+  const spendGate = checkSpendGate({
+    heron: execution?.heron,
+    model: modelStr,
+    attestation: request.headers.get(CONSUMER_ATTESTATION_HEADER),
+  });
   if (execution) execution.spendGate = spendGate;
   if (spendGate.decision === "deny") {
     log.warn("SPEND", `Budget deny for consumer "${spendGate.consumer}": ${spendGate.reason}`);

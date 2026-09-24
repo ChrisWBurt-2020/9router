@@ -22,6 +22,18 @@
  *    this preserves existing behavior for unmanaged traffic).
  *  - Denial is terminal: error code "budget_exhausted", HTTP 402, never
  *    retried, never falls back to another provider/model.
+ *  - Listed consumer with no approved daily_cap_usd -> DENY (fail closed;
+ *    budget values need the owner's word; "consumer_budget_unset").
+ *  - Consumers with attested:true must carry a valid X-Heron-Consumer-
+ *    Attestation HMAC from the trusted task proxy; missing/invalid -> DENY
+ *    ("consumer_attestation_failed"). No shared secret configured -> DENY
+ *    ("consumer_attestation_unverifiable"). Unattested consumers keep the
+ *    legacy behavior.
+ *  - Consumer allowed_models (when present) is authoritative: any other
+ *    model -> DENY ("model_not_permitted"). Free-only consumers
+ *    (paid_tier_allowed:false or tier_order without "paid") refuse paid
+ *    models terminally ("paid_tier_not_permitted"); their tier resolves to
+ *    "free" so provider.max_price 0/0 is injected.
  *  - Allowed managed requests get provider.max_price injected on outbound
  *    OpenRouter requests (free tier -> 0/0).
  */
@@ -29,10 +41,24 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { isFreeModelId } from "open-sse/config/freeModels.js";
 
 export const BUDGET_EXHAUSTED_CODE = "budget_exhausted";
+
+/** Phase-1 automatic task-execution consumer (governor-registered). */
+export const HARNESS_CONSUMER = "heron-harness-opencode";
+
+/** HMAC attestation header the trusted task proxy signs per request. */
+export const CONSUMER_ATTESTATION_HEADER = "x-heron-consumer-attestation";
+export const CONSUMER_ATTESTATION_VERSION = "v1";
+
+/** Env var holding the proxy/9router shared HMAC secret. Never logged. */
+export const PROXY_HMAC_SECRET_ENV = "HERON_PROXY_HMAC_SECRET";
+
+/** Max attestation age, in seconds, either side of now. */
+export const ATTESTATION_MAX_SKEW_S = 600;
 
 /** Conservative paid-tier ceiling (deepseek-v4-flash sticker) when the quota
  *  file has no explicit max_price for the consumer. Per-MTok USD. */
@@ -109,14 +135,96 @@ function allow(consumer, { unmanaged = false, entry = null } = {}) {
 }
 
 /**
+ * True when the consumer's quota entry forbids paid tiers (Phase-1 free-only
+ * policy): explicit flag, or a tier_order that omits "paid".
+ */
+export function isFreeOnlyConsumer(entry) {
+  if (!entry || typeof entry !== "object") return false;
+  if (entry.paid_tier_allowed === false) return true;
+  if (Array.isArray(entry.tier_order)) return !entry.tier_order.includes("paid");
+  return false;
+}
+
+/**
+ * Per-consumer model allowlist. When the quota entry carries allowed_models,
+ * only those exact model ids are permitted; anything else is refused rather
+ * than substituted. Absent list (or unknown model) -> no judgment here.
+ */
+export function consumerAllowsModel(entry, model) {
+  const list = entry && Array.isArray(entry.allowed_models) ? entry.allowed_models : null;
+  if (!list) return true;
+  if (typeof model !== "string" || !model.trim()) return true;
+  const want = model.trim();
+  return list.some((m) => typeof m === "string" && m.trim() === want);
+}
+
+function attestationMessage({ consumer, traceId, workId, ts }) {
+  return [CONSUMER_ATTESTATION_VERSION, consumer, traceId || "", workId || "", String(ts)].join("\n");
+}
+
+/**
+ * Verify a trusted-task-proxy attestation for a consumer claim.
+ *
+ * Wire format: "v1,<unix_ts>,<hex_hmac_sha256>" where the HMAC (keyed by the
+ * shared proxy secret) covers "v1\\n<consumer>\\n<trace_id>\\n<work_id>\\n<ts>".
+ * This binds the consumer identity to the task/proxy path: a bare
+ * x-heron-consumer header without a valid attestation is rejected.
+ *
+ * Pure; the secret is passed in so tests never need process env.
+ *
+ * @returns {{ok:true}|{ok:false, reason:string}} reason is one of
+ *   secret_unconfigured | attestation_missing | attestation_malformed |
+ *   attestation_expired | attestation_mismatch
+ */
+export function verifyConsumerAttestation({ consumer, traceId = "", workId = "", attestation = null, secret = null } = {}) {
+  if (!secret) return { ok: false, reason: "secret_unconfigured" };
+  if (typeof attestation !== "string" || !attestation) return { ok: false, reason: "attestation_missing" };
+  const parts = attestation.split(",");
+  if (parts.length !== 3 || parts[0] !== CONSUMER_ATTESTATION_VERSION) {
+    return { ok: false, reason: "attestation_malformed" };
+  }
+  const ts = Number(parts[1]);
+  if (!Number.isSafeInteger(ts) || ts <= 0) return { ok: false, reason: "attestation_malformed" };
+  if (Math.abs(Date.now() / 1000 - ts) > ATTESTATION_MAX_SKEW_S) {
+    return { ok: false, reason: "attestation_expired" };
+  }
+  const expected = createHmac("sha256", secret)
+    .update(attestationMessage({ consumer, traceId, workId, ts: parts[1] }), "utf8")
+    .digest();
+  let actual;
+  try {
+    actual = Buffer.from(parts[2], "hex");
+  } catch {
+    return { ok: false, reason: "attestation_malformed" };
+  }
+  if (actual.length !== expected.length) return { ok: false, reason: "attestation_mismatch" };
+  if (!timingSafeEqual(actual, expected)) return { ok: false, reason: "attestation_mismatch" };
+  return { ok: true };
+}
+
+/**
+ * Sign an attestation (the trusted task proxy side). Kept here so the proxy
+ * and the verifier share one canonical wire format.
+ */
+export function signConsumerAttestation({ consumer, traceId = "", workId = "", secret, nowMs = Date.now() } = {}) {
+  const ts = String(Math.floor(nowMs / 1000));
+  const mac = createHmac("sha256", secret)
+    .update(attestationMessage({ consumer, traceId, workId, ts }), "utf8")
+    .digest("hex");
+  return `${CONSUMER_ATTESTATION_VERSION},${ts},${mac}`;
+}
+
+/**
  * Per-request quota check. Pure + synchronous (local file read). Must run
  * before any provider is contacted and before any fallback logic.
  *
  * @param {object} opts
  * @param {object} opts.heron - Heron correlation values (execution.heron)
+ * @param {string|null} opts.model - requested model id (allowlist / free-only checks)
+ * @param {string|null} opts.attestation - raw X-Heron-Consumer-Attestation header value
  * @returns {object} gate decision {decision:"allow"|"deny", consumer, reason, message, unmanaged, entry, tokenCeiling}
  */
-export function checkSpendGate({ heron = null } = {}) {
+export function checkSpendGate({ heron = null, model = null, attestation = null } = {}) {
   const consumer = resolveConsumer(heron);
   const heronControlled = hasHeronCorrelation(heron);
   if (heronControlled && !consumer) {
@@ -139,9 +247,62 @@ export function checkSpendGate({ heron = null } = {}) {
     // keep existing behavior (no max_price injection, no cap).
     return allow(consumer, { unmanaged: true });
   }
-  const cap = Number(entry.daily_cap_usd);
+  // Consumer identity bound to the task/proxy path: attested consumers must
+  // carry a valid proxy HMAC. A bare x-heron-consumer header is rejected.
+  if (entry.attested === true) {
+    const v = (heron && (heron.values || heron)) || {};
+    const secret = (process.env[PROXY_HMAC_SECRET_ENV] || "").trim() || null;
+    const check = verifyConsumerAttestation({
+      consumer,
+      traceId: typeof v.trace_id === "string" ? v.trace_id : "",
+      workId: typeof v.work_id === "string" ? v.work_id : "",
+      attestation,
+      secret,
+    });
+    if (!check.ok) {
+      const reason = check.reason === "secret_unconfigured"
+        ? "consumer_attestation_unverifiable"
+        : "consumer_attestation_failed";
+      return deny(
+        consumer,
+        reason,
+        `Consumer "${consumer}" requires a trusted-proxy attestation (${check.reason}); refusing before provider routing.`,
+      );
+    }
+  }
+  // A registered consumer with no approved budget fails closed. Budget values
+  // need the owner's explicit word; null/unset is never "unlimited" (note:
+  // Number(null) === 0, so the raw value must be checked before coercion).
+  const rawCap = entry.daily_cap_usd;
+  if (rawCap === null || rawCap === undefined || !Number.isFinite(Number(rawCap))) {
+    return deny(
+      consumer,
+      "consumer_budget_unset",
+      `Consumer "${consumer}" is registered but has no approved daily budget; failing closed. No provider will be contacted.`,
+    );
+  }
+  const cap = Number(rawCap);
+  // Per-consumer model allowlist: refuse rather than substitute.
+  if (!consumerAllowsModel(entry, model)) {
+    return deny(
+      consumer,
+      "model_not_permitted",
+      `Model "${model}" is not permitted for consumer "${consumer}"; refusing rather than substituting.`,
+    );
+  }
+  // Phase-1 free-only: a paid model for a free-only consumer is terminal.
+  if (typeof model === "string" && model.trim() && isFreeOnlyConsumer(entry)) {
+    const allowlisted = Array.isArray(entry.allowed_models) && consumerAllowsModel(entry, model);
+    if (!allowlisted && !isFreeModelId(model)) {
+      return deny(
+        consumer,
+        "paid_tier_not_permitted",
+        `Paid model "${model}" requested for free-only consumer "${consumer}" (Phase-1 policy: no paid fallback); refusing before provider routing.`,
+      );
+    }
+  }
   const spent = Number(entry.spent_today_usd || 0);
-  if (Number.isFinite(cap) && Number.isFinite(spent) && spent >= cap) {
+  if (Number.isFinite(spent) && spent >= cap) {
     return deny(
       consumer,
       "budget_exhausted",
@@ -158,6 +319,10 @@ export function checkSpendGate({ heron = null } = {}) {
  */
 export function resolveTier(gate, { model = null, freeTierOnly = false } = {}) {
   if (freeTierOnly || isFreeModelId(model)) return "free";
+  // Free-only consumers never route a paid tier: their allowed models are
+  // $0-priced via max_price 0/0 injection, and anything else was denied at
+  // the gate before routing.
+  if (isFreeOnlyConsumer(gate?.entry)) return "free";
   const order = Array.isArray(gate?.entry?.tier_order) ? gate.entry.tier_order : ["free", "paid"];
   return order.find((t) => t && t !== "free") || "paid";
 }

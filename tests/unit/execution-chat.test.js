@@ -145,7 +145,7 @@ describe("execution receipts through the chat handler", () => {
         {
           model: "openai/gpt-4o",
           messages: [{ role: "user", content: "hi" }],
-          metadata: { heron_trace_id: "tr-live-1", heron_intent_id: "int-7", user: "keep" },
+          metadata: { heron_trace_id: "tr-live-1", heron_intent_id: "int-7", heron_consumer: "homenode-voice", user: "keep" },
         },
         { "X-Heron-World-Id": "world-9" }
       )
@@ -154,7 +154,7 @@ describe("execution receipts through the chat handler", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("X-9Router-Execution-Id")).toMatch(/^9r_exec_/);
     expect(res.headers.get("X-Heron-Trace-Id")).toBe("tr-live-1");
-    expect(capturedExecution.heron).toEqual({ trace_id: "tr-live-1", intent_id: "int-7", world_id: "world-9" });
+    expect(capturedExecution.heron).toEqual({ trace_id: "tr-live-1", intent_id: "int-7", world_id: "world-9", consumer: "homenode-voice" });
 
     const receipt = buildExecutionReceipt(capturedExecution);
     expect(receipt.heron.trace_id).toBe("tr-live-1");
@@ -194,7 +194,7 @@ describe("execution receipts through the chat handler", () => {
     });
 
     const res = await handleChat(
-      chatRequest({ model: "combo-a", messages: [{ role: "user", content: "hi" }], metadata: { heron_trace_id: "tr-combo" } })
+      chatRequest({ model: "combo-a", messages: [{ role: "user", content: "hi" }], metadata: { heron_trace_id: "tr-combo", heron_consumer: "homenode-voice" } })
     );
 
     expect(res.status).toBe(200);

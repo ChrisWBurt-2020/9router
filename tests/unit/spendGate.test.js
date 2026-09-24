@@ -20,6 +20,13 @@ import {
   resetVoiceKeyWarning,
   VOICE_CONSUMER,
   VOICE_KEY_ENV_VAR,
+  HARNESS_CONSUMER,
+  CONSUMER_ATTESTATION_HEADER,
+  PROXY_HMAC_SECRET_ENV,
+  verifyConsumerAttestation,
+  signConsumerAttestation,
+  isFreeOnlyConsumer,
+  consumerAllowsModel,
 } from "../../src/lib/spendGate.js";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "spend-gate-test-"));
@@ -371,5 +378,178 @@ describe("selectOutboundCredentials", () => {
     });
     expect(out).toBe(orig);
     expect(warnings).toHaveLength(1);
+  });
+});
+
+describe("heron-harness-opencode consumer (Phase-1 production grant)", () => {
+  const CONSUMER = "heron-harness-opencode";
+  const FREE_MODEL = "qwen/qwen3.8-27b:free";
+  const PAID_MODEL = "deepseek/deepseek-v4-flash";
+  const SECRET = "test-only-proxy-secret-0123456789abcdef";
+  const OLD_SECRET = process.env[PROXY_HMAC_SECRET_ENV];
+
+  function harnessQuota(overrides = {}) {
+    return {
+      [CONSUMER]: {
+        daily_cap_usd: 0.5,
+        spent_today_usd: 0,
+        tier_order: ["free"],
+        paid_tier_allowed: false,
+        allowed_models: [FREE_MODEL, "nvidia/nemotron-3-super-120b-a12b:free", "openrouter/free"],
+        attested: true,
+        ...overrides,
+      },
+    };
+  }
+  function heronClaim(overrides = {}) {
+    return { consumer: CONSUMER, trace_id: "trace-1", work_id: "task-abc123", ...overrides };
+  }
+  function goodAttestation(overrides = {}) {
+    return signConsumerAttestation({ consumer: CONSUMER, traceId: "trace-1", workId: "task-abc123", secret: SECRET, ...overrides });
+  }
+
+  beforeEach(() => {
+    process.env[PROXY_HMAC_SECRET_ENV] = SECRET;
+  });
+  afterEach(() => {
+    if (OLD_SECRET === undefined) delete process.env[PROXY_HMAC_SECRET_ENV];
+    else process.env[PROXY_HMAC_SECRET_ENV] = OLD_SECRET;
+  });
+
+  it("allows an attested free-model claim from the task proxy path", () => {
+    writeQuota(harnessQuota());
+    const gate = checkSpendGate({ heron: heronClaim(), model: FREE_MODEL, attestation: goodAttestation() });
+    expect(gate.decision).toBe("allow");
+    expect(gate.consumer).toBe(CONSUMER);
+    const { tier, maxPrice } = pricePolicyFor(gate, { model: FREE_MODEL });
+    expect(tier).toBe("free");
+    expect(maxPrice).toEqual({ prompt: 0, completion: 0 });
+  });
+
+  it("rejects a spoofed consumer claim with no attestation", () => {
+    writeQuota(harnessQuota());
+    const gate = checkSpendGate({ heron: heronClaim(), model: FREE_MODEL, attestation: null });
+    expect(gate.decision).toBe("deny");
+    expect(gate.reason).toBe("consumer_attestation_failed");
+    expect(isBudgetExhaustedResponse(budgetExhaustedResponse(gate))).toBe(true);
+  });
+
+  it("rejects an attestation signed for a different consumer", () => {
+    writeQuota(harnessQuota());
+    const forged = signConsumerAttestation({ consumer: "homenode-voice", traceId: "trace-1", workId: "task-abc123", secret: SECRET });
+    const gate = checkSpendGate({ heron: heronClaim(), model: FREE_MODEL, attestation: forged });
+    expect(gate.decision).toBe("deny");
+    expect(gate.reason).toBe("consumer_attestation_failed");
+  });
+
+  it("rejects an attestation bound to a different trace/work identity", () => {
+    writeQuota(harnessQuota());
+    const replay = signConsumerAttestation({ consumer: CONSUMER, traceId: "trace-OTHER", workId: "task-OTHER", secret: SECRET });
+    const gate = checkSpendGate({ heron: heronClaim(), model: FREE_MODEL, attestation: replay });
+    expect(gate.decision).toBe("deny");
+    expect(gate.reason).toBe("consumer_attestation_failed");
+  });
+
+  it("rejects an expired attestation", () => {
+    writeQuota(harnessQuota());
+    const stale = goodAttestation({ nowMs: Date.now() - 3600_000 });
+    const gate = checkSpendGate({ heron: heronClaim(), model: FREE_MODEL, attestation: stale });
+    expect(gate.decision).toBe("deny");
+    expect(gate.reason).toBe("consumer_attestation_failed");
+  });
+
+  it("fails closed when the shared secret is not configured", () => {
+    writeQuota(harnessQuota());
+    delete process.env[PROXY_HMAC_SECRET_ENV];
+    const gate = checkSpendGate({ heron: heronClaim(), model: FREE_MODEL, attestation: goodAttestation() });
+    expect(gate.decision).toBe("deny");
+    expect(gate.reason).toBe("consumer_attestation_unverifiable");
+  });
+
+  it("denies a registered consumer with no approved budget (fail closed)", () => {
+    writeQuota(harnessQuota({ daily_cap_usd: null }));
+    const gate = checkSpendGate({ heron: heronClaim(), model: FREE_MODEL, attestation: goodAttestation() });
+    expect(gate.decision).toBe("deny");
+    expect(gate.reason).toBe("consumer_budget_unset");
+  });
+
+  it("denies a model outside the consumer allowlist", () => {
+    writeQuota(harnessQuota());
+    const gate = checkSpendGate({ heron: heronClaim(), model: PAID_MODEL, attestation: goodAttestation() });
+    expect(gate.decision).toBe("deny");
+    expect(gate.reason).toBe("model_not_permitted");
+  });
+
+  it("denies a paid model for a free-only consumer even without an allowlist", () => {
+    writeQuota({ [CONSUMER]: { daily_cap_usd: 0.5, spent_today_usd: 0, paid_tier_allowed: false, attested: false } });
+    const gate = checkSpendGate({ heron: heronClaim(), model: PAID_MODEL });
+    expect(gate.decision).toBe("deny");
+    expect(gate.reason).toBe("paid_tier_not_permitted");
+  });
+
+  it("leaves legacy unattested consumers untouched", () => {
+    writeQuota({ "homenode-voice": { daily_cap_usd: 1.0, spent_today_usd: 0.0 } });
+    const gate = checkSpendGate({ heron: { consumer: "homenode-voice", trace_id: "t" }, model: "qwen/qwen3.8-27b:free" });
+    expect(gate.decision).toBe("allow");
+  });
+
+  it("keeps work_id as provenance and consumer as billing identity on receipts", () => {
+    const execution = {
+      executionId: "9r_exec_receipt_test",
+      heron: { consumer: CONSUMER, work_id: "task-abc123", trace_id: "trace-1" },
+      spendGate: { consumer: CONSUMER, decision: "allow", reason: "budget_available" },
+      actual: { provider: "openrouter", model: FREE_MODEL },
+      requestedModel: FREE_MODEL,
+      endpoint: "/v1/chat/completions",
+    };
+    const report = spendReportFromExecution(execution, {
+      status: "success",
+      tokens: { input_tokens: 120, output_tokens: 45 },
+      costUsd: 0,
+    });
+    expect(report.consumer).toBe(CONSUMER);            // billing identity
+    expect(report.consumer).not.toBe("task-abc123");  // work_id never becomes billing
+    expect(report.trace_id).toBe("trace-1");          // correlation preserved
+    expect(report.request_id).toBe("9r_exec_receipt_test");
+    expect(report.model).toBe(FREE_MODEL);
+    expect(report.provider).toBe("openrouter");
+    expect(report.input_tokens).toBe(120);
+    expect(report.output_tokens).toBe(45);
+    expect(report.cost_usd).toBe(0);
+  });
+});
+
+describe("verifyConsumerAttestation", () => {
+  const SECRET = "test-only-proxy-secret-0123456789abcdef";
+  it("round-trips a signed attestation", () => {
+    const a = signConsumerAttestation({ consumer: "c", traceId: "t", workId: "w", secret: SECRET });
+    expect(verifyConsumerAttestation({ consumer: "c", traceId: "t", workId: "w", attestation: a, secret: SECRET })).toEqual({ ok: true });
+  });
+  it("rejects tampered mac", () => {
+    const a = signConsumerAttestation({ consumer: "c", traceId: "t", workId: "w", secret: SECRET });
+    const tampered = a.slice(0, -1) + (a.endsWith("0") ? "1" : "0");
+    expect(verifyConsumerAttestation({ consumer: "c", traceId: "t", workId: "w", attestation: tampered, secret: SECRET }).ok).toBe(false);
+  });
+  it("rejects malformed input", () => {
+    expect(verifyConsumerAttestation({ consumer: "c", attestation: "bogus", secret: SECRET }).reason).toBe("attestation_malformed");
+    expect(verifyConsumerAttestation({ consumer: "c", attestation: null, secret: SECRET }).reason).toBe("attestation_missing");
+    expect(verifyConsumerAttestation({ consumer: "c", attestation: "v1,1,abc", secret: null }).reason).toBe("secret_unconfigured");
+  });
+});
+
+describe("isFreeOnlyConsumer / consumerAllowsModel", () => {
+  it("detects free-only entries", () => {
+    expect(isFreeOnlyConsumer({ paid_tier_allowed: false })).toBe(true);
+    expect(isFreeOnlyConsumer({ tier_order: ["free"] })).toBe(true);
+    expect(isFreeOnlyConsumer({ tier_order: ["free", "paid"] })).toBe(false);
+    expect(isFreeOnlyConsumer({ daily_cap_usd: 1 })).toBe(false);
+    expect(isFreeOnlyConsumer(null)).toBe(false);
+  });
+  it("enforces exact allowlist membership", () => {
+    const entry = { allowed_models: ["qwen/qwen3.8-27b:free"] };
+    expect(consumerAllowsModel(entry, "qwen/qwen3.8-27b:free")).toBe(true);
+    expect(consumerAllowsModel(entry, "deepseek/deepseek-v4-flash")).toBe(false);
+    expect(consumerAllowsModel({}, "anything")).toBe(true);
+    expect(consumerAllowsModel(entry, null)).toBe(true);
   });
 });
