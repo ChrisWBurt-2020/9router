@@ -39,3 +39,7 @@ filter before writing it down:
 Procedures → `.opencode/skills/<name>/SKILL.md`. Terse always-on constraints →
 this file. Durable project facts → project memory (`panoma_remember`), not a
 file.
+- **Push to the `fork` remote, never `origin`.** This checkout's `origin` is
+  `decolua/9router` (read-only; pushes fail 403). Chris's repo
+  `ChrisWBurt-2020/9router` is wired as the `fork` remote — spend-gate and
+  other personal work goes to `fork`, e.g. `git push fork master`.
