@@ -22,10 +22,10 @@ function rateLimitResponse(status = 429) {
 
 describe("isFreeModelId", () => {
   it("accepts only exact catalog entries, case-insensitively", () => {
-    expect(isFreeModelId("openrouter/qwen/qwen3.6-plus:free")).toBe(true);
-    expect(isFreeModelId("openrouter/nex-agi/nex-n2.5-pro:free")).toBe(true);
+    expect(isFreeModelId("openrouter/qwen/qwen3.8-27b:free")).toBe(true);
+    expect(isFreeModelId("openrouter/nvidia/nemotron-3-super-120b-a12b:free")).toBe(true);
     expect(isFreeModelId("openrouter/poolside/laguna-s-2.1:free")).toBe(true);
-    expect(isFreeModelId("OPENROUTER/QWEN/QWEN3.6-PLUS:FREE")).toBe(true);
+    expect(isFreeModelId("OPENROUTER/QWEN/QWEN3.8-27B:FREE")).toBe(true);
   });
 
   it("whitelists the openrouter/free catch-all gateway even without a suffix", () => {
@@ -65,7 +65,7 @@ describe("handleComboChat freeTierOnly", () => {
     const handleSingleModel = vi.fn(async (_body, model) => okResponse(`ans-${model}`));
     const res = await handleComboChat({
       body: { messages: [{ role: "user", content: "hi" }] },
-      models: ["openai/gpt-4o", "openrouter/qwen/qwen3.6-plus:free"],
+      models: ["openai/gpt-4o", "openrouter/qwen/qwen3.8-27b:free"],
       handleSingleModel,
       log,
       comboName: "gov-build",
@@ -75,7 +75,7 @@ describe("handleComboChat freeTierOnly", () => {
 
     expect(res.status).toBe(200);
     expect(handleSingleModel).toHaveBeenCalledTimes(1);
-    expect(handleSingleModel.mock.calls[0][1]).toBe("openrouter/qwen/qwen3.6-plus:free");
+    expect(handleSingleModel.mock.calls[0][1]).toBe("openrouter/qwen/qwen3.8-27b:free");
   });
 
   it("filters a capacity-adapter-style paid addition injected mid-list", async () => {
@@ -116,12 +116,12 @@ describe("handleComboChat freeTierOnly", () => {
 
   it("still fails over between free models on rate limits (none paid ever tried)", async () => {
     const handleSingleModel = vi.fn(async (_body, model) => {
-      if (model === "openrouter/qwen/qwen3-coder:free") return rateLimitResponse(429);
+      if (model === "openrouter/google/gemma-4-31b-it:free") return rateLimitResponse(429);
       return okResponse("recovered");
     });
     const res = await handleComboChat({
       body: { messages: [{ role: "user", content: "hi" }] },
-      models: ["openrouter/qwen/qwen3-coder:free", "openrouter/nex-agi/nex-n2.5-pro:free"],
+      models: ["openrouter/google/gemma-4-31b-it:free", "openrouter/nvidia/nemotron-3-super-120b-a12b:free"],
       handleSingleModel,
       log,
       comboName: "gov-build",
@@ -132,7 +132,7 @@ describe("handleComboChat freeTierOnly", () => {
     expect(res.status).toBe(200);
     expect(handleSingleModel).toHaveBeenCalledTimes(2);
     const tried = handleSingleModel.mock.calls.map(([, m]) => m);
-    expect(tried).toEqual(["openrouter/qwen/qwen3-coder:free", "openrouter/nex-agi/nex-n2.5-pro:free"]);
+    expect(tried).toEqual(["openrouter/google/gemma-4-31b-it:free", "openrouter/nvidia/nemotron-3-super-120b-a12b:free"]);
   });
 
   it("keeps prior behaviour when freeTierOnly is not set (paid models still tried)", async () => {
@@ -162,8 +162,8 @@ describe("handleFusionChat freeTierOnly", () => {
       body: { messages: [{ role: "user", content: "hi" }] },
       models: [
         "openai/gpt-4o",
-        "openrouter/qwen/qwen3.6-plus:free",
-        "openrouter/nex-agi/nex-n2.5-pro:free",
+        "openrouter/qwen/qwen3.8-27b:free",
+        "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
       ],
       handleSingleModel,
       log,
@@ -178,11 +178,11 @@ describe("handleFusionChat freeTierOnly", () => {
     expect(tried).not.toContain("openai/gpt-4o");
     expect(handleSingleModel).toHaveBeenCalledWith(
       expect.anything(),
-      "openrouter/qwen/qwen3.6-plus:free",
+      "openrouter/qwen/qwen3.8-27b:free",
       true
     );
     // No explicit free judge -> panel[0], reused as the synthesis call (2-arg, no isPanel).
-    expect(handleSingleModel.mock.calls.at(-1)[1]).toBe("openrouter/qwen/qwen3.6-plus:free");
+    expect(handleSingleModel.mock.calls.at(-1)[1]).toBe("openrouter/qwen/qwen3.8-27b:free");
     expect(handleSingleModel.mock.calls.at(-1)[2]).toBeUndefined();
   });
 
@@ -224,7 +224,7 @@ describe("handleFusionChat freeTierOnly", () => {
     const handleSingleModel = vi.fn(async (_body, model) => okResponse(`answer from ${model}`));
     await handleFusionChat({
       body: { messages: [{ role: "user", content: "hi" }] },
-      models: ["openrouter/qwen/qwen3.6-plus:free", "openrouter/nex-agi/nex-n2.5-pro:free"],
+      models: ["openrouter/qwen/qwen3.8-27b:free", "openrouter/nvidia/nemotron-3-super-120b-a12b:free"],
       handleSingleModel,
       log,
       comboName: "legacy-fusion",
